@@ -11,6 +11,7 @@
   tls-eio
   x509
   ca-certs
+  mirage-crypto
   mirage-crypto-rng
   mirage-crypto-rng.unix
   uri
