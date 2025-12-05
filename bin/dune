@@ -1,0 +1,22 @@
+(executable
+ (name massive_relay)
+ (public_name massive-relay)
+ (package massive-relay)
+ (libraries
+  massive_relay
+  eio
+  eio_main
+  yojson
+  cmdliner
+  containers)
+ (preprocess
+  (pps ppx_deriving.std ppx_yojson_conv)))
+
+(env
+ (_
+  (flags
+   :standard
+   -open
+   Containers
+   -open
+   Ppx_yojson_conv_lib.Yojson_conv.Primitives)))

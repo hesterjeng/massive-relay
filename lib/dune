@@ -1,0 +1,29 @@
+(library
+ (name massive_relay)
+ (public_name massive-relay)
+ (libraries
+  eio
+  eio_main
+  yojson
+  ptime
+  containers
+  tls
+  tls-eio
+  x509
+  ca-certs
+  mirage-crypto-rng
+  mirage-crypto-rng.unix
+  uri
+  base64
+  cstruct)
+ (preprocess
+  (pps ppx_deriving.std ppx_yojson_conv)))
+
+(env
+ (_
+  (flags
+   :standard
+   -open
+   Containers
+   -open
+   Ppx_yojson_conv_lib.Yojson_conv.Primitives)))
