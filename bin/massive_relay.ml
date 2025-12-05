@@ -2,15 +2,15 @@
 
 module Args = struct
   let default_port = 9999
-  let default_polygon_key = Sys.getenv_opt "POLYGON_KEY"
+  let default_massive_key = Sys.getenv_opt "MASSIVE_KEY"
 
   let port_arg =
     let doc = "Port for local clients to connect (default 9999)" in
     Cmdliner.Arg.(value & opt int default_port & info ["port"; "p"] ~doc)
 
-  let polygon_key_arg =
-    let doc = "Polygon API key (default from POLYGON_KEY env var)" in
-    Cmdliner.Arg.(value & opt (some string) default_polygon_key & info ["key"; "k"] ~doc)
+  let massive_key_arg =
+    let doc = "Massive API key (default from MASSIVE_KEY env var)" in
+    Cmdliner.Arg.(value & opt (some string) default_massive_key & info ["key"; "k"] ~doc)
 end
 
 module Relay = struct
@@ -33,16 +33,16 @@ module Relay = struct
     )
 
   (* Main relay loop *)
-  let run ~sw ~env ~polygon_key ~local_port =
+  let run ~sw ~env ~massive_key ~local_port =
     (* Start local server *)
     Massive_relay.Local_server.start ~sw ~env ~port:local_port
       ~on_subscribe:(fun symbols -> add_pending_symbols symbols);
 
-    (* Connect to Polygon *)
-    Eio.traceln "Relay: Connecting to Polygon...";
-    match Massive_relay.Polygon_client.Client.connect ~sw ~env ~polygon_key () with
+    (* Connect to Massive *)
+    Eio.traceln "Relay: Connecting to Massive...";
+    match Massive_relay.Polygon_client.Client.connect ~sw ~env ~massive_key () with
     | Error e ->
-      Eio.traceln "Relay: Failed to connect to Polygon: %s"
+      Eio.traceln "Relay: Failed to connect to Massive: %s"
         (match e with
          | `HandshakeError s -> s
          | `InvalidScheme s -> "Invalid scheme: " ^ s
@@ -101,21 +101,21 @@ module Relay = struct
 end
 
 module Cmd = struct
-  let run port polygon_key =
-    match polygon_key with
+  let run port massive_key =
+    match massive_key with
     | None ->
-      Eio.traceln "Error: No Polygon API key provided.";
-      Eio.traceln "Set POLYGON_KEY environment variable or use --key option."
+      Eio.traceln "Error: No Massive API key provided.";
+      Eio.traceln "Set MASSIVE_KEY environment variable or use --key option."
     | Some key ->
       Eio.traceln "Massive Relay starting...";
       Eio.traceln "  Local port: %d" port;
       Eio_main.run @@ fun env ->
       Eio.Switch.run @@ fun sw ->
-      Relay.run ~sw ~env ~polygon_key:key ~local_port:port
+      Relay.run ~sw ~env ~massive_key:key ~local_port:port
 
   let top =
-    let term = Cmdliner.Term.(const run $ Args.port_arg $ Args.polygon_key_arg) in
-    let doc = "Polygon WebSocket relay - share one connection among multiple clients" in
+    let term = Cmdliner.Term.(const run $ Args.port_arg $ Args.massive_key_arg) in
+    let doc = "Massive WebSocket relay - share one connection among multiple clients" in
     let info = Cmdliner.Cmd.info ~doc "massive-relay" in
     Cmdliner.Cmd.v info term
 end
