@@ -6,12 +6,12 @@
   eio_main
   yojson
   ptime
+  ptime.clock.os
   containers
   tls
   tls-eio
   x509
-  ca-certs
-  mirage-crypto
+  digestif
   mirage-crypto-rng
   mirage-crypto-rng.unix
   uri

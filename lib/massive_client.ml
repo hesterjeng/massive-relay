@@ -1,21 +1,21 @@
 (* Massive WebSocket client for real-time market data *)
-(* Adapted from longleaf's massive_websocket.ml *)
+(* Connects to Massive API (wss://socket.polygon.io/stocks) *)
 
-(* Polygon WebSocket authentication message *)
+(* Massive WebSocket authentication message *)
 type auth_message = {
   action : string;
   params : string;
 }
 [@@deriving yojson]
 
-(* Polygon WebSocket subscription message *)
+(* Massive WebSocket subscription message *)
 type subscribe_message = {
   action : string;
   params : string;  (* Comma-separated channels like "A.AAPL,A.MSFT" *)
 }
 [@@deriving yojson]
 
-(* Polygon status message *)
+(* Massive status message *)
 type status_message = {
   ev : string;          (* Event type: "status" *)
   status : string;      (* e.g., "auth_success", "connected" *)
@@ -23,7 +23,7 @@ type status_message = {
 }
 [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
-(* Polygon aggregate per second message *)
+(* Massive aggregate per second message *)
 type aggregate_message = {
   ev : string;          (* Event type: "A" for aggregates per second *)
   sym : string;         (* Stock ticker symbol *)
@@ -44,7 +44,7 @@ type aggregate_message = {
 [@@deriving show, yojson]
 
 (* Parse message as aggregate or status *)
-type polygon_message =
+type massive_message =
   | Status of status_message
   | Aggregate of aggregate_message
   | Unknown of string

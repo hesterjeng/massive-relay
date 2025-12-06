@@ -1,11 +1,37 @@
 (* Local WebSocket server for relay clients *)
+(* Speaks Massive protocol for drop-in compatibility *)
 
-(* Client request message *)
+(* Massive-style request message: {"action":"subscribe","params":"A.AAPL,A.MSFT"} *)
 type client_request = {
   action : string;
-  symbols : string list;
+  params : string;
 }
 [@@deriving yojson]
+
+(* Parse Massive params string into symbol list *)
+(* "A.AAPL,A.MSFT" -> ["AAPL"; "MSFT"] *)
+let parse_params params =
+  String.split_on_char ',' params
+  |> List.map String.trim
+  |> List.filter (fun s -> String.length s > 0)
+  |> List.map (fun s ->
+    (* Strip "A." or "AM." prefix if present *)
+    if String.length s > 2 && String.equal (String.sub s 0 2) "A." then
+      String.sub s 2 (String.length s - 2)
+    else if String.length s > 3 && String.equal (String.sub s 0 3) "AM." then
+      String.sub s 3 (String.length s - 3)
+    else
+      s
+  )
+
+(* Build Massive-style status message array *)
+let status_message status message =
+  let msg = `Assoc [
+    ("ev", `String "status");
+    ("status", `String status);
+    ("message", `String message);
+  ] in
+  Yojson.Safe.to_string (`List [msg])
 
 (* Client connection *)
 type client = {
@@ -70,28 +96,27 @@ let broadcast_for_symbol symbol msg =
     )
   )
 
-(* Broadcast raw JSON message, checking symbol in the message *)
+(* Broadcast aggregate message wrapped in array (Massive protocol) *)
 let broadcast_aggregate json_str =
-  (* Parse to get symbol, then broadcast *)
+  (* Parse to get symbol, then broadcast wrapped in array *)
   try
     let json = Yojson.Safe.from_string json_str in
     let symbol = Yojson.Safe.Util.(member "sym" json |> to_string) in
-    broadcast_for_symbol symbol json_str
+    (* Wrap in array for Massive protocol compatibility *)
+    let wrapped = Yojson.Safe.to_string (`List [json]) in
+    broadcast_for_symbol symbol wrapped
   with _ ->
-    (* If parsing fails, broadcast to all *)
+    (* If parsing fails, broadcast to all (still wrapped) *)
+    let wrapped = "[" ^ json_str ^ "]" in
     Eio.Mutex.use_ro clients_mutex (fun () ->
       !clients |> List.iter (fun client ->
-        ignore (send_to_client client json_str)
+        ignore (send_to_client client wrapped)
       )
     )
 
 (* Compute SHA-1 hash for WebSocket accept key *)
 let sha1_hash str =
-  (* Simple SHA-1 implementation for WebSocket handshake *)
-  (* We use Mirage_crypto for this *)
-  let open Mirage_crypto.Hash in
-  let digest = SHA1.digest (Cstruct.of_string str) in
-  Cstruct.to_string digest
+  Digestif.SHA1.digest_string str |> Digestif.SHA1.to_raw_string
 
 (* WebSocket server handshake *)
 let websocket_handshake flow =
@@ -163,9 +188,8 @@ let handle_client ~on_subscribe flow _addr =
   | Ok () ->
     let client = add_client flow in
 
-    (* Send welcome message *)
-    let welcome = `Assoc [("status", `String "connected"); ("client_id", `Int client.id)] in
-    ignore (send_to_client client (Yojson.Safe.to_string welcome));
+    (* Send Massive-style connected status *)
+    ignore (send_to_client client (status_message "connected" "Connected to relay"));
 
     let rec loop () =
       match receive_frame flow with
@@ -181,29 +205,31 @@ let handle_client ~on_subscribe flow _addr =
             let json = Yojson.Safe.from_string payload in
             let req = client_request_of_yojson json in
             match req.action with
+            | "auth" ->
+              (* Auth always succeeds for local relay *)
+              Eio.traceln "Local: Client %d authenticated" client.id;
+              ignore (send_to_client client (status_message "auth_success" "Authenticated"))
             | "subscribe" ->
-              update_subscriptions client req.symbols;
-              on_subscribe req.symbols;
-              let resp = `Assoc [
-                ("status", `String "subscribed");
-                ("symbols", `List (List.map (fun s -> `String s) client.subscribed_symbols))
-              ] in
-              ignore (send_to_client client (Yojson.Safe.to_string resp))
+              let symbols = parse_params req.params in
+              update_subscriptions client symbols;
+              on_subscribe symbols;
+              Eio.traceln "Local: Client %d subscribed to: %s"
+                client.id (String.concat ", " symbols);
+              ignore (send_to_client client (status_message "success" "Subscribed"))
             | "unsubscribe" ->
+              let symbols = parse_params req.params in
               Eio.Mutex.use_rw clients_mutex ~protect:true (fun () ->
                 client.subscribed_symbols <- List.filter
-                  (fun s -> not (List.mem s req.symbols))
+                  (fun s -> not (List.mem s symbols))
                   client.subscribed_symbols
               );
-              let resp = `Assoc [("status", `String "unsubscribed")] in
-              ignore (send_to_client client (Yojson.Safe.to_string resp))
+              ignore (send_to_client client (status_message "success" "Unsubscribed"))
             | _ ->
-              let resp = `Assoc [("error", `String "unknown action")] in
-              ignore (send_to_client client (Yojson.Safe.to_string resp))
+              Eio.traceln "Local: Unknown action: %s" req.action;
+              ignore (send_to_client client (status_message "error" ("Unknown action: " ^ req.action)))
           with e ->
             Eio.traceln "Local: Error parsing client message: %s" (Printexc.to_string e);
-            let resp = `Assoc [("error", `String "invalid json")] in
-            ignore (send_to_client client (Yojson.Safe.to_string resp)));
+            ignore (send_to_client client (status_message "error" "Invalid message format")));
           loop ()
         | Ping ->
           (* Respond with pong *)

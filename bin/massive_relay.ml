@@ -14,7 +14,7 @@ module Args = struct
 end
 
 module Relay = struct
-  (* Pending subscriptions that need to be sent to Polygon *)
+  (* Pending subscriptions that need to be sent to Massive *)
   let pending_symbols : string list ref = ref []
   let pending_mutex = Eio.Mutex.create ()
 
@@ -40,7 +40,7 @@ module Relay = struct
 
     (* Connect to Massive *)
     Eio.traceln "Relay: Connecting to Massive...";
-    match Massive_relay.Polygon_client.Client.connect ~sw ~env ~massive_key () with
+    match Massive_relay.Massive_client.Client.connect ~sw ~env ~massive_key () with
     | Error e ->
       Eio.traceln "Relay: Failed to connect to Massive: %s"
         (match e with
@@ -54,7 +54,7 @@ module Relay = struct
          | `InvalidOpcode i -> "Invalid opcode: " ^ string_of_int i
          | `ConnectionClosed -> "Connection closed")
     | Ok client ->
-      Eio.traceln "Relay: Connected to Polygon, starting main loop";
+      Eio.traceln "Relay: Connected to Massive, starting main loop";
 
       (* Background fiber to handle new subscriptions *)
       Eio.Fiber.fork ~sw (fun () ->
@@ -63,7 +63,7 @@ module Relay = struct
           let new_symbols = take_pending_symbols () in
           if List.length new_symbols > 0 then begin
             Eio.traceln "Relay: Subscribing to %d new symbols" (List.length new_symbols);
-            match Massive_relay.Polygon_client.Client.subscribe client new_symbols with
+            match Massive_relay.Massive_client.Client.subscribe client new_symbols with
             | Ok () -> ()
             | Error _ -> Eio.traceln "Relay: Failed to subscribe"
           end
@@ -72,17 +72,17 @@ module Relay = struct
 
       (* Main receive loop *)
       let rec loop () =
-        match Massive_relay.Polygon_client.Client.receive client with
+        match Massive_relay.Massive_client.Client.receive client with
         | Ok (`Messages msgs) ->
           msgs |> List.iter (fun msg ->
             match msg with
-            | Massive_relay.Polygon_client.Status status ->
+            | Massive_relay.Massive_client.Status status ->
               Eio.traceln "Relay: Status - %s: %s" status.status status.message
-            | Massive_relay.Polygon_client.Aggregate agg ->
+            | Massive_relay.Massive_client.Aggregate agg ->
               (* Broadcast to subscribed clients *)
-              let json = Massive_relay.Polygon_client.yojson_of_aggregate_message agg in
+              let json = Massive_relay.Massive_client.yojson_of_aggregate_message agg in
               Massive_relay.Local_server.broadcast_aggregate (Yojson.Safe.to_string json)
-            | Massive_relay.Polygon_client.Unknown _ -> ()
+            | Massive_relay.Massive_client.Unknown _ -> ()
           );
           loop ()
         | Ok `Ping -> loop ()
