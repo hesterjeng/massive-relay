@@ -32,29 +32,38 @@ module Relay = struct
       symbols
     )
 
+  let format_error = function
+    | `HandshakeError s -> s
+    | `InvalidScheme s -> "Invalid scheme: " ^ s
+    | `InvalidUrl s -> "Invalid URL: " ^ s
+    | `DnsError s -> "DNS error: " ^ s
+    | `TlsError s -> "TLS error: " ^ s
+    | `WriteError s -> "Write error: " ^ s
+    | `ReadError s -> "Read error: " ^ s
+    | `InvalidOpcode i -> "Invalid opcode: " ^ string_of_int i
+    | `ConnectionClosed -> "Connection closed"
+
   (* Main relay loop *)
   let run ~sw ~env ~massive_key ~local_port =
     (* Start local server *)
     Massive_relay.Local_server.start ~sw ~env ~port:local_port
       ~on_subscribe:(fun symbols -> add_pending_symbols symbols);
 
-    (* Connect to Massive *)
-    Eio.traceln "Relay: Connecting to Massive...";
-    match Massive_relay.Massive_client.Client.connect ~sw ~env ~massive_key () with
-    | Error e ->
-      Eio.traceln "Relay: Failed to connect to Massive: %s"
-        (match e with
-         | `HandshakeError s -> s
-         | `InvalidScheme s -> "Invalid scheme: " ^ s
-         | `InvalidUrl s -> "Invalid URL: " ^ s
-         | `DnsError s -> "DNS error: " ^ s
-         | `TlsError s -> "TLS error: " ^ s
-         | `WriteError s -> "Write error: " ^ s
-         | `ReadError s -> "Read error: " ^ s
-         | `InvalidOpcode i -> "Invalid opcode: " ^ string_of_int i
-         | `ConnectionClosed -> "Connection closed")
-    | Ok client ->
-      Eio.traceln "Relay: Connected to Massive, starting main loop";
+    (* Connect to Massive with reconnection loop *)
+    let rec connect_loop () =
+      Eio.traceln "Relay: Connecting to Massive...";
+      match Massive_relay.Massive_client.Client.connect ~sw ~env ~massive_key () with
+      | Error e ->
+        Eio.traceln "Relay: Failed to connect to Massive: %s" (format_error e);
+        Eio.traceln "Relay: Retrying in 5 seconds...";
+        Eio.Time.sleep (Eio.Stdenv.clock env) 5.0;
+        connect_loop ()
+      | Ok client ->
+        Eio.traceln "Relay: Connected to Massive, starting main loop";
+        run_with_client ~sw ~env client
+
+    and run_with_client ~sw ~env client =
+      let client_ref = ref client in
 
       (* Background fiber to handle new subscriptions *)
       Eio.Fiber.fork ~sw (fun () ->
@@ -63,16 +72,16 @@ module Relay = struct
           let new_symbols = take_pending_symbols () in
           if List.length new_symbols > 0 then begin
             Eio.traceln "Relay: Subscribing to %d new symbols" (List.length new_symbols);
-            match Massive_relay.Massive_client.Client.subscribe client new_symbols with
+            match Massive_relay.Massive_client.Client.subscribe !client_ref new_symbols with
             | Ok () -> ()
             | Error _ -> Eio.traceln "Relay: Failed to subscribe"
           end
         done
       );
 
-      (* Main receive loop *)
+      (* Main receive loop with reconnection *)
       let rec loop () =
-        match Massive_relay.Massive_client.Client.receive client with
+        match Massive_relay.Massive_client.Client.receive !client_ref with
         | Ok (`Messages msgs) ->
           msgs |> List.iter (fun msg ->
             match msg with
@@ -88,16 +97,33 @@ module Relay = struct
         | Ok `Ping -> loop ()
         | Ok `Other -> loop ()
         | Error `ConnectionClosed ->
-          Eio.traceln "Relay: Connection closed, exiting"
+          Eio.traceln "Relay: Connection closed, reconnecting...";
+          reconnect_and_loop ()
         | Error (`ParseError e) ->
           Eio.traceln "Relay: Parse error: %s" e;
           loop ()
         | Error (`ReadError e) ->
-          Eio.traceln "Relay: Read error: %s" e
+          Eio.traceln "Relay: Read error: %s (reconnecting...)" e;
+          reconnect_and_loop ()
         | Error (`InvalidOpcode i) ->
-          Eio.traceln "Relay: Invalid opcode: %d" i
+          Eio.traceln "Relay: Invalid opcode: %d (reconnecting...)" i;
+          reconnect_and_loop ()
+
+      and reconnect_and_loop () =
+        match Massive_relay.Massive_client.Client.reconnect ~sw ~env !client_ref with
+        | Ok new_client ->
+          client_ref := new_client;
+          Eio.traceln "Relay: Reconnected successfully";
+          loop ()
+        | Error e ->
+          Eio.traceln "Relay: Reconnection failed: %s" (format_error e);
+          Eio.traceln "Relay: Retrying in 5 seconds...";
+          Eio.Time.sleep (Eio.Stdenv.clock env) 5.0;
+          reconnect_and_loop ()
       in
       loop ()
+    in
+    connect_loop ()
 end
 
 module Cmd = struct

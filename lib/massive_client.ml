@@ -240,4 +240,26 @@ module Client = struct
   let close client =
     Eio.traceln "Massive: Closing connection";
     Websocket.Connection.close client.conn
+
+  (* Reconnect and resubscribe *)
+  let reconnect ~sw ~env client =
+    let ( let* ) = Result.( let* ) in
+
+    (* Close old connection first to release file descriptor *)
+    close client;
+
+    Eio.traceln "Massive: Attempting to reconnect...";
+    let* new_client = connect ~sw ~env ~massive_key:client.massive_key () in
+
+    (* Update reconnect count *)
+    new_client.reconnect_attempts <- client.reconnect_attempts + 1;
+
+    (* Resubscribe to previous symbols if any *)
+    if List.length client.subscribed_symbols > 0 then begin
+      Eio.traceln "Massive: Resubscribing to %d symbols after reconnect"
+        (List.length client.subscribed_symbols);
+      let* () = subscribe new_client client.subscribed_symbols in
+      Ok new_client
+    end else
+      Ok new_client
 end
