@@ -182,11 +182,15 @@ let receive_frame flow =
 
 (* Handle a client connection *)
 let handle_client ~on_subscribe flow _addr =
+  (* Ensure flow is always closed when we're done, regardless of how we exit *)
+  Fun.protect ~finally:(fun () ->
+    (try Eio.Flow.close flow with _ -> ())
+  ) @@ fun () ->
   (* Perform WebSocket handshake *)
   match websocket_handshake flow with
   | Error _ -> ()
   | Ok () ->
-    let client = add_client flow in
+    let client = add_client (flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
 
     (* Send Massive-style connected status *)
     ignore (send_to_client client (status_message "connected" "Connected to relay"));
@@ -270,7 +274,7 @@ let start ~sw ~env ~port ~on_subscribe =
   Eio.Fiber.fork ~sw (fun () ->
     while true do
       Eio.Net.accept_fork socket ~sw (fun flow addr ->
-        handle_client ~on_subscribe (flow :> Eio.Flow.two_way_ty Eio.Resource.t) addr
+        handle_client ~on_subscribe flow addr
       )
         ~on_error:(fun e ->
           Eio.traceln "Local: Client error: %s" (Printexc.to_string e)
