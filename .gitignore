@@ -1,0 +1,14 @@
+_build/
+node_modules/
+package.json
+package-lock.json
+notes.org
+.envrc
+server.exe
+tearsheets/__pycache__/
+elisp/flycheck_top.el
+lib/javascript/css.css
+lib/javascript/plotly_latest.css
+dune-odep.svg
+data/*.json
+_html/
