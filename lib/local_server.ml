@@ -265,15 +265,30 @@ let handle_client ~on_subscribe flow _addr =
 (* Start the local WebSocket server *)
 let start ~sw ~env ~port ~on_subscribe =
   let net = Eio.Stdenv.net env in
-  let addr = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+  let addr_v4 = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
+  let addr_v6 = `Tcp (Eio.Net.Ipaddr.V6.loopback, port) in
 
   Eio.traceln "Local: Starting WebSocket server on ws://localhost:%d" port;
 
-  let socket = Eio.Net.listen net ~sw ~backlog:10 ~reuse_addr:true addr in
+  let socket_v4 = Eio.Net.listen net ~sw ~backlog:10 ~reuse_addr:true addr_v4 in
+  let socket_v6 = Eio.Net.listen net ~sw ~backlog:10 ~reuse_addr:true addr_v6 in
 
+  (* Accept on IPv4 *)
   Eio.Fiber.fork ~sw (fun () ->
     while true do
-      Eio.Net.accept_fork socket ~sw (fun flow addr ->
+      Eio.Net.accept_fork socket_v4 ~sw (fun flow addr ->
+        handle_client ~on_subscribe flow addr
+      )
+        ~on_error:(fun e ->
+          Eio.traceln "Local: Client error: %s" (Printexc.to_string e)
+        )
+    done
+  );
+
+  (* Accept on IPv6 *)
+  Eio.Fiber.fork ~sw (fun () ->
+    while true do
+      Eio.Net.accept_fork socket_v6 ~sw (fun flow addr ->
         handle_client ~on_subscribe flow addr
       )
         ~on_error:(fun e ->
