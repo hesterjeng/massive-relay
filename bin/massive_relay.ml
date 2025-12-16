@@ -128,6 +128,8 @@ end
 
 module Cmd = struct
   let run port massive_key =
+    (* Initialize RNG before any crypto operations *)
+    Massive_relay.Https.init_rng ();
     match massive_key with
     | None ->
       Eio.traceln "Error: No Massive API key provided.";
