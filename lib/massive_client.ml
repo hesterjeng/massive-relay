@@ -41,7 +41,7 @@ type aggregate_message = {
   e : int;              (* End timestamp (Unix milliseconds) *)
   otc : bool option; [@yojson.option]  (* OTC ticker indicator *)
 }
-[@@deriving show, yojson]
+[@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
 (* Parse message as aggregate or status *)
 type massive_message =
