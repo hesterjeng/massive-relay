@@ -84,16 +84,42 @@ let send_to_client client msg =
     let encoded = Websocket.Frame.encode frame in
     Eio.Flow.copy_string encoded client.flow;
     true
-  with _ ->
+  with exn ->
+    Eio.traceln "Local: Failed to send to client %d: %s" client.id (Printexc.to_string exn);
     false
+
+(* Stats for diagnostics - reset every 60s to avoid overflow *)
+let broadcast_count = ref 0
+let send_success_count = ref 0
+let send_failure_count = ref 0
+let last_stats_time = ref 0.0
+
+(* Log stats periodically (called inside mutex, so quick) *)
+let maybe_log_stats () =
+  let now = Unix.gettimeofday () in
+  if Float.(now -. !last_stats_time > 60.0) then begin
+    let num_clients = List.length !clients in
+    let client_info = !clients |> List.map (fun c ->
+      Printf.sprintf "%d:%d" c.id (List.length c.subscribed_symbols)
+    ) |> String.concat "," in
+    Eio.traceln "Local: STATS bc=%d ok=%d fail=%d clients=%d [%s]"
+      !broadcast_count !send_success_count !send_failure_count num_clients client_info;
+    broadcast_count := 0;
+    send_success_count := 0;
+    send_failure_count := 0;
+    last_stats_time := now
+  end
 
 (* Broadcast message to clients subscribed to a symbol *)
 let broadcast_for_symbol symbol msg =
   Eio.Mutex.use_ro clients_mutex (fun () ->
+    incr broadcast_count;
     !clients |> List.iter (fun client ->
       if List.mem symbol client.subscribed_symbols then
-        ignore (send_to_client client msg)
-    )
+        if send_to_client client msg then incr send_success_count
+        else incr send_failure_count
+    );
+    maybe_log_stats ()
   )
 
 (* Broadcast aggregate message wrapped in array (Massive protocol) *)
