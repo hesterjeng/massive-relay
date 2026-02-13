@@ -203,7 +203,10 @@ module Client = struct
        with _ -> Unknown ev_type)
     | "A" | "AS" ->
       (try Aggregate (aggregate_message_of_yojson json)
-       with _ -> Unknown ev_type)
+       with e ->
+         Eio.traceln "Massive: Failed to parse aggregate: %s" (Printexc.to_string e);
+         Eio.traceln "Massive: JSON was: %s" (Yojson.Safe.to_string json);
+         Unknown ev_type)
     | _ -> Unknown ev_type
 
   (* Receive next frame *)
