@@ -64,11 +64,18 @@ module Relay = struct
 
     and run_with_client ~sw ~env client =
       let client_ref = ref client in
+      let clock = Eio.Stdenv.clock env in
+      let last_data_time = ref (Eio.Time.now clock) in
+
+      (* Upstream data staleness: if we receive only pings and no actual data
+         for this long, the upstream connection is alive but not delivering.
+         Reconnect to get a fresh upstream session. *)
+      let data_staleness_sec = 120.0 in
 
       (* Background fiber to handle new subscriptions *)
       Eio.Fiber.fork ~sw (fun () ->
         while true do
-          Eio.Time.sleep (Eio.Stdenv.clock env) 1.0;
+          Eio.Time.sleep clock 1.0;
           let new_symbols = take_pending_symbols () in
           if List.length new_symbols > 0 then begin
             Eio.traceln "Relay: Subscribing to %d new symbols" (List.length new_symbols);
@@ -79,10 +86,25 @@ module Relay = struct
         done
       );
 
+      (* Timeout for upstream receive. If nothing at all arrives (not even pings)
+         for this long, the TCP connection is dead. *)
+      let receive_timeout_sec = 120.0 in
+
       (* Main receive loop with reconnection *)
       let rec loop () =
-        match Massive_relay.Massive_client.Client.receive !client_ref with
+        let receive_result =
+          match
+            Eio.Time.with_timeout_exn clock receive_timeout_sec (fun () ->
+              Massive_relay.Massive_client.Client.receive !client_ref)
+          with
+          | result -> result
+          | exception Eio.Time.Timeout ->
+            Eio.traceln "Relay: Upstream receive timeout (%.0fs), reconnecting..." receive_timeout_sec;
+            Error (`ReadError "receive timeout")
+        in
+        match receive_result with
         | Ok (`Messages msgs) ->
+          last_data_time := Eio.Time.now clock;
           msgs |> List.iter (fun msg ->
             match msg with
             | Massive_relay.Massive_client.Status status ->
@@ -94,7 +116,13 @@ module Relay = struct
             | Massive_relay.Massive_client.Unknown _ -> ()
           );
           loop ()
-        | Ok `Ping -> loop ()
+        | Ok `Ping ->
+          let age = Eio.Time.now clock -. !last_data_time in
+          if Float.(age > data_staleness_sec) then begin
+            Eio.traceln "Relay: Upstream stale (%.0fs of pings, no data), reconnecting..." age;
+            reconnect_and_loop ()
+          end else
+            loop ()
         | Ok `Other -> loop ()
         | Error `ConnectionClosed ->
           Eio.traceln "Relay: Connection closed, reconnecting...";
@@ -113,12 +141,13 @@ module Relay = struct
         match Massive_relay.Massive_client.Client.reconnect ~sw ~env !client_ref with
         | Ok new_client ->
           client_ref := new_client;
+          last_data_time := Eio.Time.now clock;
           Eio.traceln "Relay: Reconnected successfully";
           loop ()
         | Error e ->
           Eio.traceln "Relay: Reconnection failed: %s" (format_error e);
           Eio.traceln "Relay: Retrying in 5 seconds...";
-          Eio.Time.sleep (Eio.Stdenv.clock env) 5.0;
+          Eio.Time.sleep clock 5.0;
           reconnect_and_loop ()
       in
       loop ()
