@@ -110,35 +110,30 @@ let maybe_log_stats () =
     last_stats_time := now
   end
 
-(* Broadcast message to clients subscribed to a symbol *)
-let broadcast_for_symbol symbol msg =
-  Eio.Mutex.use_ro clients_mutex (fun () ->
-    incr broadcast_count;
-    !clients |> List.iter (fun client ->
-      if List.mem symbol client.subscribed_symbols then
-        if send_to_client client msg then incr send_success_count
-        else incr send_failure_count
-    );
-    maybe_log_stats ()
-  )
+(* Broadcast to all connected clients.
+   Every upstream message is for a symbol some client requested, so no
+   per-symbol filtering needed — clients ignore irrelevant symbols.
+   Collects failed clients under read lock, removes them after. *)
+let broadcast msg =
+  let failed =
+    Eio.Mutex.use_ro clients_mutex (fun () ->
+      incr broadcast_count;
+      let failed =
+        !clients |> List.filter_map (fun client ->
+          if send_to_client client msg then
+            (incr send_success_count; None)
+          else
+            (incr send_failure_count; Some client))
+      in
+      maybe_log_stats ();
+      failed)
+  in
+  List.iter remove_client failed
 
 (* Broadcast aggregate message wrapped in array (Massive protocol) *)
 let broadcast_aggregate json_str =
-  (* Parse to get symbol, then broadcast wrapped in array *)
-  try
-    let json = Yojson.Safe.from_string json_str in
-    let symbol = Yojson.Safe.Util.(member "sym" json |> to_string) in
-    (* Wrap in array for Massive protocol compatibility *)
-    let wrapped = Yojson.Safe.to_string (`List [json]) in
-    broadcast_for_symbol symbol wrapped
-  with _ ->
-    (* If parsing fails, broadcast to all (still wrapped) *)
-    let wrapped = "[" ^ json_str ^ "]" in
-    Eio.Mutex.use_ro clients_mutex (fun () ->
-      !clients |> List.iter (fun client ->
-        ignore (send_to_client client wrapped)
-      )
-    )
+  let wrapped = "[" ^ json_str ^ "]" in
+  broadcast wrapped
 
 (* Compute SHA-1 hash for WebSocket accept key *)
 let sha1_hash str =

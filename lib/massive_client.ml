@@ -43,10 +43,11 @@ type aggregate_message = {
 }
 [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
-(* Parse message as aggregate or status *)
+(* Parse message as aggregate or status.
+   Aggregates carry the raw JSON to avoid re-serialization on broadcast. *)
 type massive_message =
   | Status of status_message
-  | Aggregate of aggregate_message
+  | Aggregate of { symbol : string; raw_json : Yojson.Safe.t }
   | Unknown of string
 
 (* WebSocket client for Massive *)
@@ -188,10 +189,13 @@ module Client = struct
     Eio.traceln "Massive: Subscribing to %d symbols" (List.length symbols);
 
     let* () = Websocket.Connection.send_text client.conn msg_str in
-    client.subscribed_symbols <- symbols @ client.subscribed_symbols;
+    client.subscribed_symbols <-
+      List.sort_uniq ~cmp:String.compare (symbols @ client.subscribed_symbols);
     Ok ()
 
-  (* Parse a message from JSON *)
+  (* Parse a message from JSON.
+     For aggregates, only extract the symbol for routing — keep raw JSON
+     to avoid the parse-then-reserialize round-trip on every broadcast. *)
   let parse_message json =
     let ev_type = match Yojson.Safe.Util.member "ev" json with
       | `String s -> s
@@ -202,10 +206,11 @@ module Client = struct
       (try Status (status_message_of_yojson json)
        with _ -> Unknown ev_type)
     | "A" | "AS" ->
-      (try Aggregate (aggregate_message_of_yojson json)
-       with e ->
-         Eio.traceln "Massive: Failed to parse aggregate: %s" (Printexc.to_string e);
-         Eio.traceln "Massive: JSON was: %s" (Yojson.Safe.to_string json);
+      (match Yojson.Safe.Util.member "sym" json with
+       | `String symbol -> Aggregate { symbol; raw_json = json }
+       | _ ->
+         Eio.traceln "Massive: Aggregate missing sym field: %s"
+           (Yojson.Safe.to_string json);
          Unknown ev_type)
     | _ -> Unknown ev_type
 
@@ -216,7 +221,6 @@ module Client = struct
 
     match frame.Websocket.Frame.opcode with
     | Text ->
-      Eio.traceln "Massive: Frame received len=%d" (String.length frame.payload);
       (try
         let json = Yojson.Safe.from_string frame.payload in
         let messages = Yojson.Safe.Util.to_list json in

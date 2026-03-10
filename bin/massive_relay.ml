@@ -81,7 +81,9 @@ module Relay = struct
             Eio.traceln "Relay: Subscribing to %d new symbols" (List.length new_symbols);
             match Massive_relay.Massive_client.Client.subscribe !client_ref new_symbols with
             | Ok () -> ()
-            | Error _ -> Eio.traceln "Relay: Failed to subscribe"
+            | Error _ ->
+              Eio.traceln "Relay: Failed to subscribe, will retry";
+              add_pending_symbols new_symbols
           end
         done
       );
@@ -109,10 +111,9 @@ module Relay = struct
             match msg with
             | Massive_relay.Massive_client.Status status ->
               Eio.traceln "Relay: Status - %s: %s" status.status status.message
-            | Massive_relay.Massive_client.Aggregate agg ->
-              (* Broadcast to subscribed clients *)
-              let json = Massive_relay.Massive_client.yojson_of_aggregate_message agg in
-              Massive_relay.Local_server.broadcast_aggregate (Yojson.Safe.to_string json)
+            | Massive_relay.Massive_client.Aggregate { raw_json; _ } ->
+              Massive_relay.Local_server.broadcast_aggregate
+                (Yojson.Safe.to_string raw_json)
             | Massive_relay.Massive_client.Unknown _ -> ()
           );
           loop ()
