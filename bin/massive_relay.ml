@@ -65,11 +65,9 @@ module Relay = struct
     and run_with_client ~sw ~env client =
       let client_ref = ref client in
       let clock = Eio.Stdenv.clock env in
-      let last_data_time = ref (Eio.Time.now clock) in
-
-      (* Upstream data staleness: if we receive only pings and no actual data
-         for this long, the upstream connection is alive but not delivering.
-         Reconnect to get a fresh upstream session. *)
+      (* None until first real data arrives. Staleness check only applies
+         after we've seen data — avoids reconnect churn outside market hours. *)
+      let last_data_time = ref None in
       let data_staleness_sec = 120.0 in
 
       (* Background fiber to handle new subscriptions *)
@@ -106,7 +104,7 @@ module Relay = struct
         in
         match receive_result with
         | Ok (`Messages msgs) ->
-          last_data_time := Eio.Time.now clock;
+          last_data_time := Some (Eio.Time.now clock);
           msgs |> List.iter (fun msg ->
             match msg with
             | Massive_relay.Massive_client.Status status ->
@@ -118,12 +116,15 @@ module Relay = struct
           );
           loop ()
         | Ok `Ping ->
-          let age = Eio.Time.now clock -. !last_data_time in
-          if Float.(age > data_staleness_sec) then begin
-            Eio.traceln "Relay: Upstream stale (%.0fs of pings, no data), reconnecting..." age;
-            reconnect_and_loop ()
-          end else
-            loop ()
+          (match !last_data_time with
+          | None -> loop ()  (* Never received data — market likely closed *)
+          | Some t ->
+            let age = Eio.Time.now clock -. t in
+            if Float.(age > data_staleness_sec) then begin
+              Eio.traceln "Relay: Upstream stale (%.0fs of pings, no data), reconnecting..." age;
+              reconnect_and_loop ()
+            end else
+              loop ())
         | Ok `Other -> loop ()
         | Error `ConnectionClosed ->
           Eio.traceln "Relay: Connection closed, reconnecting...";
@@ -142,7 +143,7 @@ module Relay = struct
         match Massive_relay.Massive_client.Client.reconnect ~sw ~env !client_ref with
         | Ok new_client ->
           client_ref := new_client;
-          last_data_time := Eio.Time.now clock;
+          last_data_time := None;
           Eio.traceln "Relay: Reconnected successfully";
           loop ()
         | Error e ->
