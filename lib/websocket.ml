@@ -422,8 +422,6 @@ module Connection = struct
       let byte0 = Char.code (String.unsafe_get header 0) in
       let byte1 = Char.code (String.unsafe_get header 1) in
 
-      Eio.traceln "WebSocket decode: header bytes: 0x%02X 0x%02X (opcode=%d, len=%d)"
-        byte0 byte1 (byte0 land 0x0F) (byte1 land 0x7F);
 
       let fin = (byte0 land 0x80) <> 0 in
       let* opcode = Opcode.of_int (byte0 land 0x0F) in
