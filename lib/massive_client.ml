@@ -74,13 +74,13 @@ module Client = struct
     let authenticator = Https.authenticator () in
 
     if attempt > 0 then
-      Eio.traceln "Massive: Connection attempt %d/%d" attempt max_reconnect_attempts;
+      Log.traceln "Massive: Connection attempt %d/%d" attempt max_reconnect_attempts;
 
-    Eio.traceln "Massive: Connecting to %s..." (Uri.to_string url);
+    Log.traceln "Massive: Connecting to %s..." (Uri.to_string url);
 
     match Websocket.Connection.handshake ~sw ~env ~authenticator url with
     | Ok conn ->
-      Eio.traceln "Massive: Connected successfully";
+      Log.traceln "Massive: Connected successfully";
       Ok {
         conn;
         massive_key;
@@ -89,18 +89,18 @@ module Client = struct
       }
     | Error e when attempt < max_reconnect_attempts ->
       let delay = calculate_backoff_delay attempt in
-      Eio.traceln "Massive: Connection failed: %s"
+      Log.traceln "Massive: Connection failed: %s"
         (match e with
          | `InvalidScheme s -> "Invalid scheme: " ^ s
          | `InvalidUrl s -> "Invalid URL: " ^ s
          | `DnsError s -> "DNS error: " ^ s
          | `TlsError s -> "TLS error: " ^ s
          | `HandshakeError s -> "Handshake error: " ^ s);
-      Eio.traceln "Massive: Retrying in %.1f seconds" delay;
+      Log.traceln "Massive: Retrying in %.1f seconds" delay;
       Eio.Time.sleep (Eio.Stdenv.clock env) delay;
       connect_with_retry ~sw ~env ~massive_key ~attempt:(attempt + 1) ()
     | Error e ->
-      Eio.traceln "Massive: Max reconnection attempts reached";
+      Log.traceln "Massive: Max reconnection attempts reached";
       Error e
 
   (* Initial connection with authentication *)
@@ -116,7 +116,7 @@ module Client = struct
     let json = yojson_of_auth_message auth_msg in
     let msg_str = Yojson.Safe.to_string json in
 
-    Eio.traceln "Massive: Sending authentication";
+    Log.traceln "Massive: Sending authentication";
     let* () = Websocket.Connection.send_text client.conn msg_str in
 
     (* Wait for auth confirmation *)
@@ -138,7 +138,7 @@ module Client = struct
                   let status_msg : status_message = status_message_of_yojson msg in
                   if String.equal status_msg.ev "status" &&
                      String.equal status_msg.status "auth_success" then begin
-                    Eio.traceln "Massive: Authentication successful";
+                    Log.traceln "Massive: Authentication successful";
                     Ok ()
                   end else if String.equal status_msg.ev "status" &&
                               String.equal status_msg.status "auth_failed" then
@@ -150,7 +150,7 @@ module Client = struct
             in
             check_messages messages
           with e ->
-            Eio.traceln "Massive: Error parsing auth response: %s" (Printexc.to_string e);
+            Log.traceln "Massive: Error parsing auth response: %s" (Printexc.to_string e);
             wait_for_auth (retry_count + 1))
         | Ping ->
           let pong_frame = Websocket.Frame.{
@@ -186,7 +186,7 @@ module Client = struct
     let json = yojson_of_subscribe_message sub_msg in
     let msg_str = Yojson.Safe.to_string json in
 
-    Eio.traceln "Massive: Subscribing to %d symbols" (List.length symbols);
+    Log.traceln "Massive: Subscribing to %d symbols" (List.length symbols);
 
     let* () = Websocket.Connection.send_text client.conn msg_str in
     client.subscribed_symbols <-
@@ -209,7 +209,7 @@ module Client = struct
       (match Yojson.Safe.Util.member "sym" json with
        | `String symbol -> Aggregate { symbol; raw_json = json }
        | _ ->
-         Eio.traceln "Massive: Aggregate missing sym field: %s"
+         Log.traceln "Massive: Aggregate missing sym field: %s"
            (Yojson.Safe.to_string json);
          Unknown ev_type)
     | _ -> Unknown ev_type
@@ -239,13 +239,13 @@ module Client = struct
       Eio.Flow.copy_string encoded client.conn.flow;
       Ok `Ping
     | Close ->
-      Eio.traceln "Massive: Received CLOSE frame";
+      Log.traceln "Massive: Received CLOSE frame";
       Error `ConnectionClosed
     | _ ->
       Ok `Other
 
   let close client =
-    Eio.traceln "Massive: Closing connection";
+    Log.traceln "Massive: Closing connection";
     Websocket.Connection.close client.conn
 
   (* Reconnect and resubscribe *)
@@ -255,7 +255,7 @@ module Client = struct
     (* Close old connection first to release file descriptor *)
     close client;
 
-    Eio.traceln "Massive: Attempting to reconnect...";
+    Log.traceln "Massive: Attempting to reconnect...";
     let* new_client = connect ~sw ~env ~massive_key:client.massive_key () in
 
     (* Update reconnect count *)
@@ -263,7 +263,7 @@ module Client = struct
 
     (* Resubscribe to previous symbols if any *)
     if List.length client.subscribed_symbols > 0 then begin
-      Eio.traceln "Massive: Resubscribing to %d symbols after reconnect"
+      Log.traceln "Massive: Resubscribing to %d symbols after reconnect"
         (List.length client.subscribed_symbols);
       let* () = subscribe new_client client.subscribed_symbols in
       Ok new_client

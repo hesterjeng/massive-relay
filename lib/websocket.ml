@@ -117,10 +117,10 @@ module Frame = struct
         Ok (Cstruct.to_string buf)
       with
       | End_of_file ->
-        Eio.traceln "WebSocket decode: EOF while reading";
+        Log.traceln "WebSocket decode: EOF while reading";
         Error `ConnectionClosed
       | e ->
-        Eio.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
+        Log.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
         Error (`ReadError (Printexc.to_string e))
     in
 
@@ -216,7 +216,7 @@ module Connection = struct
     in
 
     (* Connect to server using DNS resolution *)
-    Eio.traceln "WebSocket: Resolving %s" hostname;
+    Log.traceln "WebSocket: Resolving %s" hostname;
     let net = Eio.Stdenv.net env in
 
     let* sock_addr =
@@ -235,7 +235,7 @@ module Connection = struct
       with e -> Error (`DnsError (Printexc.to_string e))
     in
 
-    Eio.traceln "WebSocket: Connecting to %a:%d" Eio.Net.Sockaddr.pp sock_addr port;
+    Log.traceln "WebSocket: Connecting to %a:%d" Eio.Net.Sockaddr.pp sock_addr port;
     let tcp_flow = Eio.Net.connect ~sw net sock_addr in
 
     (* Wrap with TLS if wss:// *)
@@ -283,7 +283,7 @@ module Connection = struct
       path hostname ws_key
     in
 
-    Eio.traceln "WebSocket: Sending handshake";
+    Log.traceln "WebSocket: Sending handshake";
     Eio.Flow.copy_string handshake_request flow;
 
     (* Read handshake response - buffered approach for performance *)
@@ -336,11 +336,11 @@ module Connection = struct
       else ""
     in
 
-    Eio.traceln "WebSocket: Received handshake response (%d bytes, %d leftover)"
+    Log.traceln "WebSocket: Received handshake response (%d bytes, %d leftover)"
       (String.length response) (String.length leftover);
     if String.length leftover > 0 then
-      Eio.traceln "WebSocket: WARNING - Found %d leftover bytes after HTTP headers!" (String.length leftover);
-    Eio.traceln "WebSocket: Response: %s" (String.sub response 0 (min 200 (String.length response)));
+      Log.traceln "WebSocket: WARNING - Found %d leftover bytes after HTTP headers!" (String.length leftover);
+    Log.traceln "WebSocket: Response: %s" (String.sub response 0 (min 200 (String.length response)));
 
     (* Validate response - check for 101 status *)
     let* () =
@@ -356,19 +356,19 @@ module Connection = struct
   (* Send a text message *)
   let send_text conn text =
     if conn.closed then begin
-      Eio.traceln "WebSocket send_text: connection is closed!";
+      Log.traceln "WebSocket send_text: connection is closed!";
       Error `ConnectionClosed
     end else begin
       let frame = Frame.{ fin = true; opcode = Text; mask = true; payload = text } in
       let encoded = Frame.encode frame in
-      Eio.traceln "WebSocket send_text: sending %d bytes (payload: %d bytes)"
+      Log.traceln "WebSocket send_text: sending %d bytes (payload: %d bytes)"
         (String.length encoded) (String.length text);
       try
         Eio.Flow.copy_string encoded conn.flow;
-        Eio.traceln "WebSocket send_text: sent successfully";
+        Log.traceln "WebSocket send_text: sent successfully";
         Ok ()
       with e ->
-        Eio.traceln "WebSocket send_text: ERROR: %s" (Printexc.to_string e);
+        Log.traceln "WebSocket send_text: ERROR: %s" (Printexc.to_string e);
         Error (`WriteError (Printexc.to_string e))
     end
 
@@ -404,10 +404,10 @@ module Connection = struct
                 Ok (Cstruct.to_string buf)
               with
               | End_of_file ->
-                Eio.traceln "WebSocket decode: EOF while reading";
+                Log.traceln "WebSocket decode: EOF while reading";
                 Error `ConnectionClosed
               | e ->
-                Eio.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
+                Log.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
                 Error (`ReadError (Printexc.to_string e))
             end
           end

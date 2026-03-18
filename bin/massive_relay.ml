@@ -11,6 +11,10 @@ module Args = struct
   let massive_key_arg =
     let doc = "Massive API key (default from MASSIVE_KEY env var)" in
     Cmdliner.Arg.(value & opt (some string) default_massive_key & info ["key"; "k"] ~doc)
+
+  let log_file_arg =
+    let doc = "Log file path (default: massive-relay.log)" in
+    Cmdliner.Arg.(value & opt string "massive-relay.log" & info ["log-file"; "l"] ~doc)
 end
 
 module Relay = struct
@@ -51,15 +55,15 @@ module Relay = struct
 
     (* Connect to Massive with reconnection loop *)
     let rec connect_loop () =
-      Eio.traceln "Relay: Connecting to Massive...";
+      Massive_relay.Log.traceln "Relay: Connecting to Massive...";
       match Massive_relay.Massive_client.Client.connect ~sw ~env ~massive_key () with
       | Error e ->
-        Eio.traceln "Relay: Failed to connect to Massive: %s" (format_error e);
-        Eio.traceln "Relay: Retrying in 5 seconds...";
+        Massive_relay.Log.traceln "Relay: Failed to connect to Massive: %s" (format_error e);
+        Massive_relay.Log.traceln "Relay: Retrying in 5 seconds...";
         Eio.Time.sleep (Eio.Stdenv.clock env) 5.0;
         connect_loop ()
       | Ok client ->
-        Eio.traceln "Relay: Connected to Massive, starting main loop";
+        Massive_relay.Log.traceln "Relay: Connected to Massive, starting main loop";
         run_with_client ~sw ~env client
 
     and run_with_client ~sw ~env client =
@@ -69,6 +73,8 @@ module Relay = struct
          after we've seen data — avoids reconnect churn outside market hours. *)
       let last_data_time = ref None in
       let data_staleness_sec = 120.0 in
+      let msg_count = ref 0 in
+      let ping_count = ref 0 in
 
       (* Background fiber to handle new subscriptions *)
       Eio.Fiber.fork ~sw (fun () ->
@@ -76,11 +82,11 @@ module Relay = struct
           Eio.Time.sleep clock 1.0;
           let new_symbols = take_pending_symbols () in
           if List.length new_symbols > 0 then begin
-            Eio.traceln "Relay: Subscribing to %d new symbols" (List.length new_symbols);
+            Massive_relay.Log.traceln "Relay: Subscribing to %d new symbols" (List.length new_symbols);
             match Massive_relay.Massive_client.Client.subscribe !client_ref new_symbols with
             | Ok () -> ()
             | Error _ ->
-              Eio.traceln "Relay: Failed to subscribe, will retry";
+              Massive_relay.Log.traceln "Relay: Failed to subscribe, will retry";
               add_pending_symbols new_symbols
           end
         done
@@ -99,16 +105,23 @@ module Relay = struct
           with
           | result -> result
           | exception Eio.Time.Timeout ->
-            Eio.traceln "Relay: Upstream receive timeout (%.0fs), reconnecting..." receive_timeout_sec;
+            Massive_relay.Log.traceln "Relay: Upstream receive timeout (%.0fs), reconnecting..." receive_timeout_sec;
             Error (`ReadError "receive timeout")
         in
         match receive_result with
         | Ok (`Messages msgs) ->
           last_data_time := Some (Eio.Time.now clock);
+          let n = List.length msgs in
+          msg_count := !msg_count + n;
+          if !msg_count >= 5000 then begin
+            Massive_relay.Log.traceln "Relay: upstream flowing (%d msgs, %d pings since last)" !msg_count !ping_count;
+            msg_count := 0;
+            ping_count := 0
+          end;
           msgs |> List.iter (fun msg ->
             match msg with
             | Massive_relay.Massive_client.Status status ->
-              Eio.traceln "Relay: Status - %s: %s" status.status status.message
+              Massive_relay.Log.traceln "Relay: Status - %s: %s" status.status status.message
             | Massive_relay.Massive_client.Aggregate { raw_json; _ } ->
               Massive_relay.Local_server.broadcast_aggregate
                 (Yojson.Safe.to_string raw_json)
@@ -116,27 +129,28 @@ module Relay = struct
           );
           loop ()
         | Ok `Ping ->
+          incr ping_count;
           (match !last_data_time with
           | None -> loop ()  (* Never received data — market likely closed *)
           | Some t ->
             let age = Eio.Time.now clock -. t in
             if Float.(age > data_staleness_sec) then begin
-              Eio.traceln "Relay: Upstream stale (%.0fs of pings, no data), reconnecting..." age;
+              Massive_relay.Log.traceln "Relay: Upstream stale (%.0fs of pings, no data), reconnecting..." age;
               reconnect_and_loop ()
             end else
               loop ())
         | Ok `Other -> loop ()
         | Error `ConnectionClosed ->
-          Eio.traceln "Relay: Connection closed, reconnecting...";
+          Massive_relay.Log.traceln "Relay: Connection closed, reconnecting...";
           reconnect_and_loop ()
         | Error (`ParseError e) ->
-          Eio.traceln "Relay: Parse error: %s" e;
+          Massive_relay.Log.traceln "Relay: Parse error: %s" e;
           loop ()
         | Error (`ReadError e) ->
-          Eio.traceln "Relay: Read error: %s (reconnecting...)" e;
+          Massive_relay.Log.traceln "Relay: Read error: %s (reconnecting...)" e;
           reconnect_and_loop ()
         | Error (`InvalidOpcode i) ->
-          Eio.traceln "Relay: Invalid opcode: %d (reconnecting...)" i;
+          Massive_relay.Log.traceln "Relay: Invalid opcode: %d (reconnecting...)" i;
           reconnect_and_loop ()
 
       and reconnect_and_loop () =
@@ -144,11 +158,11 @@ module Relay = struct
         | Ok new_client ->
           client_ref := new_client;
           last_data_time := None;
-          Eio.traceln "Relay: Reconnected successfully";
+          Massive_relay.Log.traceln "Relay: Reconnected successfully";
           loop ()
         | Error e ->
-          Eio.traceln "Relay: Reconnection failed: %s" (format_error e);
-          Eio.traceln "Relay: Retrying in 5 seconds...";
+          Massive_relay.Log.traceln "Relay: Reconnection failed: %s" (format_error e);
+          Massive_relay.Log.traceln "Relay: Retrying in 5 seconds...";
           Eio.Time.sleep clock 5.0;
           reconnect_and_loop ()
       in
@@ -158,22 +172,25 @@ module Relay = struct
 end
 
 module Cmd = struct
-  let run port massive_key =
+  let run port massive_key log_file =
+    (* Initialize logging first *)
+    Massive_relay.Log.init log_file;
     (* Initialize RNG before any crypto operations *)
     Massive_relay.Https.init_rng ();
     match massive_key with
     | None ->
-      Eio.traceln "Error: No Massive API key provided.";
-      Eio.traceln "Set MASSIVE_KEY environment variable or use --key option."
+      Massive_relay.Log.traceln "Error: No Massive API key provided.";
+      Massive_relay.Log.traceln "Set MASSIVE_KEY environment variable or use --key option."
     | Some key ->
-      Eio.traceln "Massive Relay starting...";
-      Eio.traceln "  Local port: %d" port;
+      Massive_relay.Log.traceln "Massive Relay starting...";
+      Massive_relay.Log.traceln "  Log file: %s" log_file;
+      Massive_relay.Log.traceln "  Local port: %d" port;
       Eio_main.run @@ fun env ->
       Eio.Switch.run @@ fun sw ->
       Relay.run ~sw ~env ~massive_key:key ~local_port:port
 
   let top =
-    let term = Cmdliner.Term.(const run $ Args.port_arg $ Args.massive_key_arg) in
+    let term = Cmdliner.Term.(const run $ Args.port_arg $ Args.massive_key_arg $ Args.log_file_arg) in
     let doc = "Massive WebSocket relay - share one connection among multiple clients" in
     let info = Cmdliner.Cmd.info ~doc "massive-relay" in
     Cmdliner.Cmd.v info term

@@ -52,7 +52,7 @@ let add_client flow =
     incr next_client_id;
     let client = { id; flow; subscribed_symbols = [] } in
     clients := client :: !clients;
-    Eio.traceln "Local: Client %d connected (total: %d)" id (List.length !clients);
+    Log.traceln "Local: Client %d connected (total: %d)" id (List.length !clients);
     client
   )
 
@@ -60,7 +60,7 @@ let add_client flow =
 let remove_client client =
   Eio.Mutex.use_rw clients_mutex ~protect:true (fun () ->
     clients := List.filter (fun c -> c.id <> client.id) !clients;
-    Eio.traceln "Local: Client %d disconnected (total: %d)" client.id (List.length !clients)
+    Log.traceln "Local: Client %d disconnected (total: %d)" client.id (List.length !clients)
   )
 
 (* Update client subscriptions *)
@@ -68,7 +68,7 @@ let update_subscriptions client symbols =
   Eio.Mutex.use_rw clients_mutex ~protect:true (fun () ->
     client.subscribed_symbols <- List.sort_uniq ~cmp:Stdlib.compare
       (client.subscribed_symbols @ symbols);
-    Eio.traceln "Local: Client %d now subscribed to %d symbols"
+    Log.traceln "Local: Client %d now subscribed to %d symbols"
       client.id (List.length client.subscribed_symbols)
   )
 
@@ -85,7 +85,7 @@ let send_to_client client msg =
     Eio.Flow.copy_string encoded client.flow;
     true
   with exn ->
-    Eio.traceln "Local: Failed to send to client %d: %s" client.id (Printexc.to_string exn);
+    Log.traceln "Local: Failed to send to client %d: %s" client.id (Printexc.to_string exn);
     false
 
 (* Stats for diagnostics - reset every 60s to avoid overflow *)
@@ -102,7 +102,7 @@ let maybe_log_stats () =
     let client_info = !clients |> List.map (fun c ->
       Printf.sprintf "%d:%d" c.id (List.length c.subscribed_symbols)
     ) |> String.concat "," in
-    Eio.traceln "Local: STATS bc=%d ok=%d fail=%d clients=%d [%s]"
+    Log.traceln "Local: STATS bc=%d ok=%d fail=%d clients=%d [%s]"
       !broadcast_count !send_success_count !send_failure_count num_clients client_info;
     broadcast_count := 0;
     send_success_count := 0;
@@ -176,7 +176,7 @@ let websocket_handshake flow =
 
   match !ws_key with
   | None ->
-    Eio.traceln "Local: No Sec-WebSocket-Key in request";
+    Log.traceln "Local: No Sec-WebSocket-Key in request";
     Error "No WebSocket key"
   | Some key ->
     (* Compute accept key: SHA1(key + magic) then base64 *)
@@ -194,7 +194,7 @@ let websocket_handshake flow =
       accept_key
     in
     Eio.Flow.copy_string response flow;
-    Eio.traceln "Local: WebSocket handshake completed";
+    Log.traceln "Local: WebSocket handshake completed";
     Ok ()
 
 (* Receive a WebSocket frame from client *)
@@ -232,13 +232,13 @@ let handle_client ~on_subscribe flow _addr =
             match req.action with
             | "auth" ->
               (* Auth always succeeds for local relay *)
-              Eio.traceln "Local: Client %d authenticated" client.id;
+              Log.traceln "Local: Client %d authenticated" client.id;
               ignore (send_to_client client (status_message "auth_success" "Authenticated"))
             | "subscribe" ->
               let symbols = parse_params req.params in
               update_subscriptions client symbols;
               on_subscribe symbols;
-              Eio.traceln "Local: Client %d subscribed to: %s"
+              Log.traceln "Local: Client %d subscribed to: %s"
                 client.id (String.concat ", " symbols);
               ignore (send_to_client client (status_message "success" "Subscribed"))
             | "unsubscribe" ->
@@ -250,10 +250,10 @@ let handle_client ~on_subscribe flow _addr =
               );
               ignore (send_to_client client (status_message "success" "Unsubscribed"))
             | _ ->
-              Eio.traceln "Local: Unknown action: %s" req.action;
+              Log.traceln "Local: Unknown action: %s" req.action;
               ignore (send_to_client client (status_message "error" ("Unknown action: " ^ req.action)))
           with e ->
-            Eio.traceln "Local: Error parsing client message: %s" (Printexc.to_string e);
+            Log.traceln "Local: Error parsing client message: %s" (Printexc.to_string e);
             ignore (send_to_client client (status_message "error" "Invalid message format")));
           loop ()
         | Ping ->
@@ -289,7 +289,7 @@ let start ~sw ~env ~port ~on_subscribe =
   let addr_v4 = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
   let addr_v6 = `Tcp (Eio.Net.Ipaddr.V6.loopback, port) in
 
-  Eio.traceln "Local: Starting WebSocket server on ws://localhost:%d" port;
+  Log.traceln "Local: Starting WebSocket server on ws://localhost:%d" port;
 
   let socket_v4 = Eio.Net.listen net ~sw ~backlog:10 ~reuse_addr:true addr_v4 in
   let socket_v6 = Eio.Net.listen net ~sw ~backlog:10 ~reuse_addr:true addr_v6 in
@@ -301,7 +301,7 @@ let start ~sw ~env ~port ~on_subscribe =
         handle_client ~on_subscribe flow addr
       )
         ~on_error:(fun e ->
-          Eio.traceln "Local: Client error: %s" (Printexc.to_string e)
+          Log.traceln "Local: Client error: %s" (Printexc.to_string e)
         )
     done
   );
@@ -313,7 +313,7 @@ let start ~sw ~env ~port ~on_subscribe =
         handle_client ~on_subscribe flow addr
       )
         ~on_error:(fun e ->
-          Eio.traceln "Local: Client error: %s" (Printexc.to_string e)
+          Log.traceln "Local: Client error: %s" (Printexc.to_string e)
         )
     done
   )
