@@ -134,7 +134,7 @@ module Relay = struct
               Massive_relay.Log.traceln "Relay: Status - %s: %s" status.status status.message
             | Massive_relay.Massive_client.Aggregate { symbol; raw_json } ->
               Hashtbl.replace symbol_last_seen symbol now;
-              Massive_relay.Local_server.broadcast_aggregate
+              Massive_relay.Local_server.broadcast_aggregate ~clock
                 (Yojson.Safe.to_string raw_json)
             | Massive_relay.Massive_client.Unknown _ -> ()
           );
@@ -159,6 +159,7 @@ module Relay = struct
                 (List.length silent) total display
             end
           end;
+          Eio.Fiber.yield ();
           loop ()
         | Ok `Ping ->
           incr ping_count;

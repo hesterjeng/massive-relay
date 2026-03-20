@@ -105,26 +105,10 @@ module Frame = struct
 
     Buffer.contents buf
 
-  (* Decode a frame from bytes *)
-  let decode flow =
+  (* Core frame decoder - takes a read_exact function *)
+  let decode_with ~read_exact =
     let ( let* ) = Result.( let* ) in
 
-    (* Read exactly n bytes *)
-    let read_exact n =
-      let buf = Cstruct.create n in
-      try
-        Eio.Flow.read_exact flow buf;
-        Ok (Cstruct.to_string buf)
-      with
-      | End_of_file ->
-        Log.traceln "WebSocket decode: EOF while reading";
-        Error `ConnectionClosed
-      | e ->
-        Log.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
-        Error (`ReadError (Printexc.to_string e))
-    in
-
-    (* Read first 2 bytes *)
     let* header = read_exact 2 in
     let byte0 = Char.code (String.unsafe_get header 0) in
     let byte1 = Char.code (String.unsafe_get header 1) in
@@ -134,7 +118,6 @@ module Frame = struct
     let mask = (byte1 land 0x80) <> 0 in
     let payload_len = byte1 land 0x7F in
 
-    (* Read extended payload length if needed *)
     let* payload_len =
       if payload_len < 126 then
         Ok payload_len
@@ -144,7 +127,6 @@ module Frame = struct
             (Char.code (String.unsafe_get len_bytes 1)))
       else begin
         let* len_bytes = read_exact 8 in
-        (* Only use lower 32 bits *)
         let len =
           (Char.code (String.unsafe_get len_bytes 4) lsl 24) lor
           (Char.code (String.unsafe_get len_bytes 5) lsl 16) lor
@@ -155,25 +137,73 @@ module Frame = struct
       end
     in
 
-    (* Read mask key if present *)
     let* mask_key =
       if mask then read_exact 4
       else Ok ""
     in
 
-    (* Read payload *)
     let* payload =
       if payload_len = 0 then Ok ""
       else read_exact payload_len
     in
 
-    (* Unmask payload if needed *)
     let payload =
       if mask then apply_mask mask_key payload
       else payload
     in
 
     Ok { fin; opcode; mask = false; payload }
+
+  (* Decode a frame from a flow *)
+  let decode flow =
+    let read_exact n =
+      let buf = Cstruct.create n in
+      try
+        Eio.Flow.read_exact flow buf;
+        Ok (Cstruct.to_string buf)
+      with
+      | End_of_file ->
+        Log.traceln "WebSocket decode: EOF while reading";
+        Error `ConnectionClosed
+      | Eio.Cancel.Cancelled _ as e -> raise e
+      | e ->
+        Log.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
+        Error (`ReadError (Printexc.to_string e))
+    in
+    decode_with ~read_exact
+
+  (* Decode a frame using buffered reading (consumes leftover bytes first) *)
+  let decode_buffered flow leftover_ref =
+    let read_exact n =
+      let buf = Cstruct.create n in
+      let rec fill offset remaining =
+        if remaining <= 0 then Ok (Cstruct.to_string buf)
+        else
+          let leftover = !leftover_ref in
+          if String.length leftover > 0 then begin
+            let use_len = min remaining (String.length leftover) in
+            Cstruct.blit_from_string leftover 0 buf offset use_len;
+            leftover_ref := String.sub leftover use_len (String.length leftover - use_len);
+            fill (offset + use_len) (remaining - use_len)
+          end else begin
+            try
+              let read_buf = Cstruct.create remaining in
+              Eio.Flow.read_exact flow read_buf;
+              Cstruct.blit read_buf 0 buf offset remaining;
+              Ok (Cstruct.to_string buf)
+            with
+            | End_of_file ->
+              Log.traceln "WebSocket decode: EOF while reading";
+              Error `ConnectionClosed
+            | Eio.Cancel.Cancelled _ as e -> raise e
+            | e ->
+              Log.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
+              Error (`ReadError (Printexc.to_string e))
+          end
+      in
+      fill 0 n
+    in
+    decode_with ~read_exact
 end
 
 (* WebSocket connection *)
@@ -409,6 +439,7 @@ module Connection = struct
               | End_of_file ->
                 Log.traceln "WebSocket decode: EOF while reading";
                 Error `ConnectionClosed
+              | Eio.Cancel.Cancelled _ as e -> raise e
               | e ->
                 Log.traceln "WebSocket decode: read error: %s" (Printexc.to_string e);
                 Error (`ReadError (Printexc.to_string e))

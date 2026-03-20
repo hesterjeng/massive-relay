@@ -72,17 +72,19 @@ let update_subscriptions client symbols =
       client.id (List.length client.subscribed_symbols)
   )
 
-(* Send WebSocket text frame to a client (server frames are NOT masked) *)
-let send_to_client client msg =
+(* Send WebSocket text frame to a client (server frames are NOT masked).
+   Uses a 5 second timeout to prevent a stalled client from blocking broadcast. *)
+let send_to_client ~clock client msg =
   try
     let frame = Websocket.Frame.{
       fin = true;
       opcode = Text;
-      mask = false;  (* Server frames are not masked *)
+      mask = false;
       payload = msg;
     } in
     let encoded = Websocket.Frame.encode frame in
-    Eio.Flow.copy_string encoded client.flow;
+    Eio.Time.with_timeout_exn clock 5.0 (fun () ->
+      Eio.Flow.copy_string encoded client.flow);
     true
   with exn ->
     Log.traceln "Local: Failed to send to client %d: %s" client.id (Printexc.to_string exn);
@@ -114,13 +116,13 @@ let maybe_log_stats () =
    Every upstream message is for a symbol some client requested, so no
    per-symbol filtering needed — clients ignore irrelevant symbols.
    Collects failed clients under read lock, removes them after. *)
-let broadcast msg =
+let broadcast ~clock msg =
   let failed =
     Eio.Mutex.use_ro clients_mutex (fun () ->
       incr broadcast_count;
       let failed =
         !clients |> List.filter_map (fun client ->
-          if send_to_client client msg then
+          if send_to_client ~clock client msg then
             (incr send_success_count; None)
           else
             (incr send_failure_count; Some client))
@@ -131,15 +133,14 @@ let broadcast msg =
   List.iter remove_client failed
 
 (* Broadcast aggregate message wrapped in array (Massive protocol) *)
-let broadcast_aggregate json_str =
-  let wrapped = "[" ^ json_str ^ "]" in
-  broadcast wrapped
+let broadcast_aggregate ~clock json_str =
+  broadcast ~clock ("[" ^ json_str ^ "]")
 
 (* Compute SHA-1 hash for WebSocket accept key *)
 let sha1_hash str =
   Digestif.SHA1.digest_string str |> Digestif.SHA1.to_raw_string
 
-(* WebSocket server handshake *)
+(* WebSocket server handshake - returns leftover bytes after HTTP headers *)
 let websocket_handshake flow =
   (* Read HTTP request *)
   let buf = Buffer.create 1024 in
@@ -156,25 +157,32 @@ let websocket_handshake flow =
               Char.equal (String.get contents (pos + 1)) '\n' &&
               Char.equal (String.get contents (pos + 2)) '\r' &&
               Char.equal (String.get contents (pos + 3)) '\n' then
-        contents
+        (contents, pos + 4)
       else
         find_end (pos + 1)
     in
     find_end 0
   in
-  let request = read_until_double_crlf () in
+  let (full_data, header_end) = read_until_double_crlf () in
+  let request = String.sub full_data 0 header_end in
+  let leftover =
+    if header_end < String.length full_data then
+      String.sub full_data header_end (String.length full_data - header_end)
+    else ""
+  in
 
   (* Extract Sec-WebSocket-Key header *)
   let lines = String.split_on_char '\n' request in
-  let ws_key = ref None in
-  List.iter (fun line ->
+  let ws_key = List.find_map (fun line ->
     let line = String.trim line in
     if String.length line > 19 &&
        String.equal (String.lowercase_ascii (String.sub line 0 18)) "sec-websocket-key:" then
-      ws_key := Some (String.trim (String.sub line 18 (String.length line - 18)))
-  ) lines;
+      Some (String.trim (String.sub line 18 (String.length line - 18)))
+    else
+      None
+  ) lines in
 
-  match !ws_key with
+  match ws_key with
   | None ->
     Log.traceln "Local: No Sec-WebSocket-Key in request";
     Error "No WebSocket key"
@@ -195,14 +203,12 @@ let websocket_handshake flow =
     in
     Eio.Flow.copy_string response flow;
     Log.traceln "Local: WebSocket handshake completed";
-    Ok ()
-
-(* Receive a WebSocket frame from client *)
-let receive_frame flow =
-  Websocket.Frame.decode flow
+    if String.length leftover > 0 then
+      Log.traceln "Local: %d leftover bytes after handshake headers" (String.length leftover);
+    Ok leftover
 
 (* Handle a client connection *)
-let handle_client ~on_subscribe flow _addr =
+let handle_client ~clock ~on_subscribe flow _addr =
   (* Ensure flow is always closed when we're done, regardless of how we exit *)
   Fun.protect ~finally:(fun () ->
     (try Eio.Flow.close flow with _ -> ())
@@ -210,14 +216,15 @@ let handle_client ~on_subscribe flow _addr =
   (* Perform WebSocket handshake *)
   match websocket_handshake flow with
   | Error _ -> ()
-  | Ok () ->
+  | Ok leftover ->
     let client = add_client (flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
+    let leftover_ref = ref leftover in
 
     (* Send Massive-style connected status *)
-    ignore (send_to_client client (status_message "connected" "Connected to relay"));
+    ignore (send_to_client ~clock client (status_message "connected" "Connected to relay"));
 
     let rec loop () =
-      match receive_frame flow with
+      match Websocket.Frame.decode_buffered flow leftover_ref with
       | Error `ConnectionClosed ->
         remove_client client
       | Error _ ->
@@ -233,14 +240,14 @@ let handle_client ~on_subscribe flow _addr =
             | "auth" ->
               (* Auth always succeeds for local relay *)
               Log.traceln "Local: Client %d authenticated" client.id;
-              ignore (send_to_client client (status_message "auth_success" "Authenticated"))
+              ignore (send_to_client ~clock client (status_message "auth_success" "Authenticated"))
             | "subscribe" ->
               let symbols = parse_params req.params in
               update_subscriptions client symbols;
               on_subscribe symbols;
               Log.traceln "Local: Client %d subscribed to: %s"
                 client.id (String.concat ", " symbols);
-              ignore (send_to_client client (status_message "success" "Subscribed"))
+              ignore (send_to_client ~clock client (status_message "success" "Subscribed"))
             | "unsubscribe" ->
               let symbols = parse_params req.params in
               Eio.Mutex.use_rw clients_mutex ~protect:true (fun () ->
@@ -248,13 +255,13 @@ let handle_client ~on_subscribe flow _addr =
                   (fun s -> not (List.mem s symbols))
                   client.subscribed_symbols
               );
-              ignore (send_to_client client (status_message "success" "Unsubscribed"))
+              ignore (send_to_client ~clock client (status_message "success" "Unsubscribed"))
             | _ ->
               Log.traceln "Local: Unknown action: %s" req.action;
-              ignore (send_to_client client (status_message "error" ("Unknown action: " ^ req.action)))
+              ignore (send_to_client ~clock client (status_message "error" ("Unknown action: " ^ req.action)))
           with e ->
             Log.traceln "Local: Error parsing client message: %s" (Printexc.to_string e);
-            ignore (send_to_client client (status_message "error" "Invalid message format")));
+            ignore (send_to_client ~clock client (status_message "error" "Invalid message format")));
           loop ()
         | Ping ->
           (* Respond with pong *)
@@ -286,6 +293,7 @@ let handle_client ~on_subscribe flow _addr =
 (* Start the local WebSocket server *)
 let start ~sw ~env ~port ~on_subscribe =
   let net = Eio.Stdenv.net env in
+  let clock = Eio.Stdenv.clock env in
   let addr_v4 = `Tcp (Eio.Net.Ipaddr.V4.loopback, port) in
   let addr_v6 = `Tcp (Eio.Net.Ipaddr.V6.loopback, port) in
 
@@ -294,26 +302,16 @@ let start ~sw ~env ~port ~on_subscribe =
   let socket_v4 = Eio.Net.listen net ~sw ~backlog:10 ~reuse_addr:true addr_v4 in
   let socket_v6 = Eio.Net.listen net ~sw ~backlog:10 ~reuse_addr:true addr_v6 in
 
-  (* Accept on IPv4 *)
-  Eio.Fiber.fork ~sw (fun () ->
-    while true do
-      Eio.Net.accept_fork socket_v4 ~sw (fun flow addr ->
-        handle_client ~on_subscribe flow addr
-      )
-        ~on_error:(fun e ->
-          Log.traceln "Local: Client error: %s" (Printexc.to_string e)
-        )
-    done
-  );
+  let on_error e =
+    Log.traceln "Local: Client error: %s" (Printexc.to_string e)
+  in
 
-  (* Accept on IPv6 *)
-  Eio.Fiber.fork ~sw (fun () ->
-    while true do
-      Eio.Net.accept_fork socket_v6 ~sw (fun flow addr ->
-        handle_client ~on_subscribe flow addr
-      )
-        ~on_error:(fun e ->
-          Log.traceln "Local: Client error: %s" (Printexc.to_string e)
-        )
-    done
-  )
+  let rec accept_loop socket =
+    Eio.Net.accept_fork socket ~sw ~on_error (fun flow addr ->
+      handle_client ~clock ~on_subscribe flow addr
+    );
+    accept_loop socket
+  in
+
+  Eio.Fiber.fork ~sw (fun () -> accept_loop socket_v4);
+  Eio.Fiber.fork ~sw (fun () -> accept_loop socket_v6)
