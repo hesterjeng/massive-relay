@@ -12,3 +12,4 @@ lib/javascript/plotly_latest.css
 dune-odep.svg
 data/*.json
 _html/
+/.agent-shell/
