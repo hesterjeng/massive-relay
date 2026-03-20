@@ -184,6 +184,8 @@ module Connection = struct
     url : Uri.t;
     mutable closed : bool;
     mutable leftover : string;  (* Buffered bytes from handshake *)
+    mutable frag_buf : Buffer.t option;  (* Fragment reassembly buffer *)
+    mutable frag_opcode : Opcode.t;  (* Opcode of first fragment *)
   }
 
   (* Perform WebSocket handshake *)
@@ -351,7 +353,8 @@ module Connection = struct
         Error (`HandshakeError ("Server did not return 101: " ^ String.sub response 0 (min 50 (String.length response))))
     in
 
-    Ok { flow; close_fn; url; closed = false; leftover }
+    Ok { flow; close_fn; url; closed = false; leftover;
+         frag_buf = None; frag_opcode = Continuation }
 
   (* Send a text message *)
   let send_text conn text =
@@ -372,7 +375,7 @@ module Connection = struct
         Error (`WriteError (Printexc.to_string e))
     end
 
-  (* Receive next frame - uses leftover buffer first, then reads from flow *)
+  (* Receive next complete message - reassembles fragmented frames per RFC 6455 *)
   let receive conn =
     if conn.closed then
       Error `ConnectionClosed
@@ -417,60 +420,122 @@ module Connection = struct
 
       let ( let* ) = Result.( let* ) in
 
-      (* Read first 2 bytes *)
-      let* header = read_exact_buffered 2 in
-      let byte0 = Char.code (String.unsafe_get header 0) in
-      let byte1 = Char.code (String.unsafe_get header 1) in
+      (* Read a single raw frame from the wire *)
+      let read_frame () =
+        let* header = read_exact_buffered 2 in
+        let byte0 = Char.code (String.unsafe_get header 0) in
+        let byte1 = Char.code (String.unsafe_get header 1) in
 
+        let fin = (byte0 land 0x80) <> 0 in
+        let* opcode = Opcode.of_int (byte0 land 0x0F) in
+        let mask = (byte1 land 0x80) <> 0 in
+        let payload_len = byte1 land 0x7F in
 
-      let fin = (byte0 land 0x80) <> 0 in
-      let* opcode = Opcode.of_int (byte0 land 0x0F) in
-      let mask = (byte1 land 0x80) <> 0 in
-      let payload_len = byte1 land 0x7F in
+        let* payload_len =
+          if payload_len < 126 then
+            Ok payload_len
+          else if payload_len = 126 then
+            let* len_bytes = read_exact_buffered 2 in
+            Ok ((Char.code (String.unsafe_get len_bytes 0) lsl 8) lor
+                (Char.code (String.unsafe_get len_bytes 1)))
+          else begin
+            let* len_bytes = read_exact_buffered 8 in
+            let len =
+              (Char.code (String.unsafe_get len_bytes 4) lsl 24) lor
+              (Char.code (String.unsafe_get len_bytes 5) lsl 16) lor
+              (Char.code (String.unsafe_get len_bytes 6) lsl 8) lor
+              (Char.code (String.unsafe_get len_bytes 7))
+            in
+            Ok len
+          end
+        in
 
-      (* Read extended payload length if needed *)
-      let* payload_len =
-        if payload_len < 126 then
-          Ok payload_len
-        else if payload_len = 126 then
-          let* len_bytes = read_exact_buffered 2 in
-          Ok ((Char.code (String.unsafe_get len_bytes 0) lsl 8) lor
-              (Char.code (String.unsafe_get len_bytes 1)))
-        else begin
-          let* len_bytes = read_exact_buffered 8 in
-          (* Only use lower 32 bits *)
-          let len =
-            (Char.code (String.unsafe_get len_bytes 4) lsl 24) lor
-            (Char.code (String.unsafe_get len_bytes 5) lsl 16) lor
-            (Char.code (String.unsafe_get len_bytes 6) lsl 8) lor
-            (Char.code (String.unsafe_get len_bytes 7))
-          in
-          Ok len
-        end
+        let* mask_key =
+          if mask then read_exact_buffered 4
+          else Ok ""
+        in
+
+        let* payload =
+          if payload_len = 0 then Ok ""
+          else read_exact_buffered payload_len
+        in
+
+        let payload =
+          if mask then Frame.apply_mask mask_key payload
+          else payload
+        in
+
+        Ok Frame.{ fin; opcode; mask = false; payload }
       in
 
-      (* Read mask key if present *)
-      let* mask_key =
-        if mask then read_exact_buffered 4
-        else Ok ""
+      (* Read frames, reassembling fragments into complete messages.
+         Control frames (Ping/Pong/Close) interleaved mid-fragment are
+         handled inline per RFC 6455 section 5.4. *)
+      let return frame =
+        conn.leftover <- !leftover_ref;
+        Ok frame
       in
 
-      (* Read payload *)
-      let* payload =
-        if payload_len = 0 then Ok ""
-        else read_exact_buffered payload_len
+      let rec receive_message () =
+        let* frame = read_frame () in
+        match conn.frag_buf with
+        | None ->
+          (* Not currently reassembling fragments *)
+          if frame.fin then
+            return frame
+          else begin
+            match frame.opcode with
+            | Text | Binary ->
+              Log.traceln "WebSocket: starting fragment reassembly (opcode=%s, %d bytes)"
+                (Opcode.show frame.opcode) (String.length frame.payload);
+              let buf = Buffer.create (String.length frame.payload * 4) in
+              Buffer.add_string buf frame.payload;
+              conn.frag_buf <- Some buf;
+              conn.frag_opcode <- frame.opcode;
+              receive_message ()
+            | _ ->
+              (* Control frames must not be fragmented *)
+              return frame
+          end
+        | Some buf ->
+          (* Currently reassembling a fragmented message *)
+          match frame.opcode with
+          | Continuation ->
+            Buffer.add_string buf frame.payload;
+            if frame.fin then begin
+              let payload = Buffer.contents buf in
+              let opcode = conn.frag_opcode in
+              conn.frag_buf <- None;
+              Log.traceln "WebSocket: fragment reassembly complete (%d bytes total)" (String.length payload);
+              return Frame.{ fin = true; opcode; mask = false; payload }
+            end else
+              receive_message ()
+          | Ping ->
+            (* Control frames can be interleaved mid-fragment *)
+            let pong = Frame.{ fin = true; opcode = Pong; mask = true; payload = frame.payload } in
+            let encoded = Frame.encode pong in
+            (try Eio.Flow.copy_string encoded conn.flow with _ -> ());
+            receive_message ()
+          | Pong ->
+            receive_message ()
+          | Close ->
+            conn.frag_buf <- None;
+            return frame
+          | Text | Binary ->
+            (* Protocol error: new data frame mid-fragment. Abort fragment, return new frame. *)
+            Log.traceln "WebSocket: protocol error - new data frame mid-fragment, aborting reassembly";
+            conn.frag_buf <- None;
+            if frame.fin then
+              return frame
+            else begin
+              let buf = Buffer.create (String.length frame.payload * 4) in
+              Buffer.add_string buf frame.payload;
+              conn.frag_buf <- Some buf;
+              conn.frag_opcode <- frame.opcode;
+              receive_message ()
+            end
       in
-
-      (* Unmask payload if needed *)
-      let payload =
-        if mask then Frame.apply_mask mask_key payload
-        else payload
-      in
-
-      (* Update connection's leftover buffer *)
-      conn.leftover <- !leftover_ref;
-
-      Ok Frame.{ fin; opcode; mask = false; payload }
+      receive_message ()
     end
 
   (* Close connection *)

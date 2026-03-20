@@ -75,6 +75,9 @@ module Relay = struct
       let data_staleness_sec = 120.0 in
       let msg_count = ref 0 in
       let ping_count = ref 0 in
+      (* Per-symbol last-seen tracking for dropout detection *)
+      let symbol_last_seen : (string, float) Hashtbl.t = Hashtbl.create 128 in
+      let last_symbol_check = ref 0.0 in
 
       (* Background fiber to handle new subscriptions *)
       Eio.Fiber.fork ~sw (fun () ->
@@ -110,11 +113,18 @@ module Relay = struct
         in
         match receive_result with
         | Ok (`Messages msgs) ->
-          last_data_time := Some (Eio.Time.now clock);
+          let now = Eio.Time.now clock in
+          let has_aggregates = List.exists (fun msg ->
+            match msg with
+            | Massive_relay.Massive_client.Aggregate _ -> true
+            | _ -> false) msgs in
+          if has_aggregates then
+            last_data_time := Some now;
           let n = List.length msgs in
           msg_count := !msg_count + n;
           if !msg_count >= 5000 then begin
-            Massive_relay.Log.traceln "Relay: upstream flowing (%d msgs, %d pings since last)" !msg_count !ping_count;
+            Massive_relay.Log.traceln "Relay: upstream flowing (%d msgs, %d pings since last, %d symbols tracked)"
+              !msg_count !ping_count (Hashtbl.length symbol_last_seen);
             msg_count := 0;
             ping_count := 0
           end;
@@ -122,11 +132,33 @@ module Relay = struct
             match msg with
             | Massive_relay.Massive_client.Status status ->
               Massive_relay.Log.traceln "Relay: Status - %s: %s" status.status status.message
-            | Massive_relay.Massive_client.Aggregate { raw_json; _ } ->
+            | Massive_relay.Massive_client.Aggregate { symbol; raw_json } ->
+              Hashtbl.replace symbol_last_seen symbol now;
               Massive_relay.Local_server.broadcast_aggregate
                 (Yojson.Safe.to_string raw_json)
             | Massive_relay.Massive_client.Unknown _ -> ()
           );
+          (* Periodic symbol dropout check - every 60s, only when data is flowing *)
+          let data_flowing = match !last_data_time with
+            | Some t -> Float.(now -. t < 30.0)
+            | None -> false in
+          if data_flowing && Float.(now -. !last_symbol_check > 60.0)
+             && Hashtbl.length symbol_last_seen > 0 then begin
+            last_symbol_check := now;
+            let total = Hashtbl.length symbol_last_seen in
+            let silent = Hashtbl.fold (fun sym last acc ->
+              let age = now -. last in
+              if Float.(age > 30.0) then (sym, age) :: acc else acc
+            ) symbol_last_seen [] in
+            if List.length silent > 0 then begin
+              let sorted = List.sort (fun (_, a) (_, b) -> Float.compare b a) silent in
+              let display = List.take 10 sorted
+                |> List.map (fun (sym, age) -> Printf.sprintf "%s(%.0fs)" sym age)
+                |> String.concat ", " in
+              Massive_relay.Log.traceln "Relay: SYMBOL_DROPOUT %d/%d symbols silent >30s: %s"
+                (List.length silent) total display
+            end
+          end;
           loop ()
         | Ok `Ping ->
           incr ping_count;
