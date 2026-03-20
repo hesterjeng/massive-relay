@@ -227,7 +227,7 @@ module Client = struct
         let parsed = List.map parse_message messages in
         Ok (`Messages parsed)
       with e ->
-        Error (`ParseError (Printexc.to_string e)))
+        Error (`ParseError (Printexc.to_string e, frame.payload)))
     | Ping ->
       let pong_frame = Websocket.Frame.{
         fin = true;

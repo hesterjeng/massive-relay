@@ -175,8 +175,8 @@ module Relay = struct
         | Error `ConnectionClosed ->
           Massive_relay.Log.traceln "Relay: Connection closed, reconnecting...";
           reconnect_and_loop ()
-        | Error (`ParseError e) ->
-          Massive_relay.Log.traceln "Relay: Parse error: %s" e;
+        | Error (`ParseError (e, raw)) ->
+          Massive_relay.Log.traceln "Relay: Parse error: %s\nRaw payload: %s" e raw;
           loop ()
         | Error (`ReadError e) ->
           Massive_relay.Log.traceln "Relay: Read error: %s (reconnecting...)" e;
