@@ -163,6 +163,7 @@ module Relay = struct
           loop ()
         | Ok `Ping ->
           incr ping_count;
+          Massive_relay.Local_server.broadcast_ping ~clock;
           (match !last_data_time with
           | None -> loop ()  (* Never received data — market likely closed *)
           | Some t ->

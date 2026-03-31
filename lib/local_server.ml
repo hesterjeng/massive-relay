@@ -136,6 +136,23 @@ let broadcast ~clock msg =
 let broadcast_aggregate ~clock json_str =
   broadcast ~clock ("[" ^ json_str ^ "]")
 
+(* Send a Ping frame to all connected clients, keeping connections alive. *)
+let broadcast_ping ~clock =
+  let ping_frame = Websocket.Frame.{
+    fin = true; opcode = Ping; mask = false; payload = "";
+  } in
+  let encoded = Websocket.Frame.encode ping_frame in
+  let failed =
+    Eio.Mutex.use_ro clients_mutex (fun () ->
+      !clients |> List.filter_map (fun client ->
+        try
+          Eio.Time.with_timeout_exn clock 5.0 (fun () ->
+            Eio.Flow.copy_string encoded client.flow);
+          None
+        with _ -> Some client))
+  in
+  List.iter remove_client failed
+
 (* Compute SHA-1 hash for WebSocket accept key *)
 let sha1_hash str =
   Digestif.SHA1.digest_string str |> Digestif.SHA1.to_raw_string
