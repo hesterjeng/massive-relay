@@ -114,11 +114,11 @@ module Relay = struct
         match receive_result with
         | Ok (`Messages msgs) ->
           let now = Eio.Time.now clock in
-          let has_aggregates = List.exists (fun msg ->
+          let has_data = List.exists (fun msg ->
             match msg with
-            | Massive_relay.Massive_client.Aggregate _ -> true
+            | Massive_relay.Massive_client.Data _ -> true
             | _ -> false) msgs in
-          if has_aggregates then
+          if has_data then
             last_data_time := Some now;
           let n = List.length msgs in
           msg_count := !msg_count + n;
@@ -132,9 +132,9 @@ module Relay = struct
             match msg with
             | Massive_relay.Massive_client.Status status ->
               Massive_relay.Log.traceln "Relay: Status - %s: %s" status.status status.message
-            | Massive_relay.Massive_client.Aggregate { symbol; raw_json } ->
+            | Massive_relay.Massive_client.Data { symbol; raw_json } ->
               Hashtbl.replace symbol_last_seen symbol now;
-              Massive_relay.Local_server.broadcast_aggregate ~clock
+              Massive_relay.Local_server.broadcast_data ~clock
                 (Yojson.Safe.to_string raw_json)
             | Massive_relay.Massive_client.Unknown _ -> ()
           );

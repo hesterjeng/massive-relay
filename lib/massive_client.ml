@@ -43,11 +43,11 @@ type aggregate_message = {
 }
 [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
-(* Parse message as aggregate or status.
-   Aggregates carry the raw JSON to avoid re-serialization on broadcast. *)
+(* Relay only cares about status vs data-to-forward.
+   Data messages carry the raw JSON to avoid re-serialization on broadcast. *)
 type massive_message =
   | Status of status_message
-  | Aggregate of { symbol : string; raw_json : Yojson.Safe.t }
+  | Data of { symbol : string; raw_json : Yojson.Safe.t }
   | Unknown of string
 
 (* WebSocket client for Massive *)
@@ -172,11 +172,8 @@ module Client = struct
   let subscribe client symbols =
     let ( let* ) = Result.( let* ) in
 
-    (* Build subscription params: "A.AAPL,A.MSFT,A.TSLA" *)
-    let params =
-      List.map (fun sym -> "A." ^ sym) symbols
-      |> String.concat ","
-    in
+    (* Forward channel strings as-is (e.g. "A.AAPL,Q.AAPL,A.MSFT,Q.MSFT") *)
+    let params = String.concat "," symbols in
 
     let sub_msg = {
       action = "subscribe";
@@ -205,14 +202,11 @@ module Client = struct
     | "status" ->
       (try Status (status_message_of_yojson json)
        with _ -> Unknown ev_type)
-    | "A" | "AS" ->
+    | _ ->
+      (* Any non-status message with a sym field is data to forward *)
       (match Yojson.Safe.Util.member "sym" json with
-       | `String symbol -> Aggregate { symbol; raw_json = json }
-       | _ ->
-         Log.traceln "Massive: Aggregate missing sym field: %s"
-           (Yojson.Safe.to_string json);
-         Unknown ev_type)
-    | _ -> Unknown ev_type
+       | `String symbol -> Data { symbol; raw_json = json }
+       | _ -> Unknown ev_type)
 
   (* Receive next frame *)
   let receive client =

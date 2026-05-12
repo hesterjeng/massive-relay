@@ -14,15 +14,6 @@ let parse_params params =
   String.split_on_char ',' params
   |> List.map String.trim
   |> List.filter (fun s -> String.length s > 0)
-  |> List.map (fun s ->
-    (* Strip "A." or "AM." prefix if present *)
-    if String.length s > 2 && String.equal (String.sub s 0 2) "A." then
-      String.sub s 2 (String.length s - 2)
-    else if String.length s > 3 && String.equal (String.sub s 0 3) "AM." then
-      String.sub s 3 (String.length s - 3)
-    else
-      s
-  )
 
 (* Build Massive-style status message array *)
 let status_message status message =
@@ -133,7 +124,7 @@ let broadcast ~clock msg =
   List.iter remove_client failed
 
 (* Broadcast aggregate message wrapped in array (Massive protocol) *)
-let broadcast_aggregate ~clock json_str =
+let broadcast_data ~clock json_str =
   broadcast ~clock ("[" ^ json_str ^ "]")
 
 (* Send a Ping frame to all connected clients, keeping connections alive. *)
