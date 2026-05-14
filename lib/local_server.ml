@@ -1,15 +1,15 @@
 (* Local WebSocket server for relay clients *)
 (* Speaks Massive protocol for drop-in compatibility *)
 
-(* Massive-style request message: {"action":"subscribe","params":"A.AAPL,A.MSFT"} *)
+(* Massive-style request message: {"action":"subscribe","params":"A.AAPL,Q.AAPL,A.MSFT"} *)
 type client_request = {
   action : string;
   params : string;
 }
 [@@deriving yojson]
 
-(* Parse Massive params string into symbol list *)
-(* "A.AAPL,A.MSFT" -> ["AAPL"; "MSFT"] *)
+(* Parse Massive params string into channel list *)
+(* "A.AAPL,Q.AAPL,A.MSFT" -> ["A.AAPL"; "Q.AAPL"; "A.MSFT"] *)
 let parse_params params =
   String.split_on_char ',' params
   |> List.map String.trim
@@ -123,7 +123,7 @@ let broadcast ~clock msg =
   in
   List.iter remove_client failed
 
-(* Broadcast aggregate message wrapped in array (Massive protocol) *)
+(* Broadcast data message wrapped in array (Massive protocol) *)
 let broadcast_data ~clock json_str =
   broadcast ~clock ("[" ^ json_str ^ "]")
 

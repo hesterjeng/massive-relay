@@ -11,7 +11,7 @@ type auth_message = {
 (* Massive WebSocket subscription message *)
 type subscribe_message = {
   action : string;
-  params : string;  (* Comma-separated channels like "A.AAPL,A.MSFT" *)
+  params : string;  (* Comma-separated channels like "A.AAPL,Q.AAPL,A.MSFT,Q.MSFT" *)
 }
 [@@deriving yojson]
 
@@ -20,26 +20,6 @@ type status_message = {
   ev : string;          (* Event type: "status" *)
   status : string;      (* e.g., "auth_success", "connected" *)
   message : string;
-}
-[@@deriving show, yojson] [@@yojson.allow_extra_fields]
-
-(* Massive aggregate per second message *)
-type aggregate_message = {
-  ev : string;          (* Event type: "A" for aggregates per second *)
-  sym : string;         (* Stock ticker symbol *)
-  v : int;              (* Tick volume *)
-  av : int;             (* Accumulated volume for the day *)
-  op : float;           (* Official opening price *)
-  vw : float;           (* Volume-weighted average price *)
-  o : float;            (* Open price for this aggregate *)
-  c : float;            (* Close price for this aggregate *)
-  h : float;            (* High price for this aggregate *)
-  l : float;            (* Low price for this aggregate *)
-  a : float;            (* Day's volume-weighted average price *)
-  z : int;              (* Average trade size *)
-  s : int;              (* Start timestamp (Unix milliseconds) *)
-  e : int;              (* End timestamp (Unix milliseconds) *)
-  otc : bool option; [@yojson.option]  (* OTC ticker indicator *)
 }
 [@@deriving show, yojson] [@@yojson.allow_extra_fields]
 
@@ -191,8 +171,8 @@ module Client = struct
     Ok ()
 
   (* Parse a message from JSON.
-     For aggregates, only extract the symbol for routing — keep raw JSON
-     to avoid the parse-then-reserialize round-trip on every broadcast. *)
+     Extract the symbol for tracking — keep raw JSON to avoid
+     re-serialization on broadcast. *)
   let parse_message json =
     let ev_type = match Yojson.Safe.Util.member "ev" json with
       | `String s -> s
