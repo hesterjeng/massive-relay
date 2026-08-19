@@ -17,24 +17,32 @@ module Args = struct
     Cmdliner.Arg.(value & opt string "massive-relay.log" & info ["log-file"; "l"] ~doc)
 end
 
+module Cluster = Massive_relay.Cluster
+
 module Relay = struct
-  (* Pending subscriptions that need to be sent to Massive *)
-  let pending_symbols : string list ref = ref []
+  (* PER-CLUSTER pending subscriptions awaiting an upstream send. Keyed by cluster so
+     a /stocks client's symbols go to the stocks upstream and a /futures client's to
+     the futures upstream. *)
+  let pending : (Cluster.t, string list) Hashtbl.t = Hashtbl.create 4
   let pending_mutex = Eio.Mutex.create ()
 
-  (* Add symbols to pending subscriptions *)
-  let add_pending_symbols symbols =
+  let add_pending ~cluster symbols =
     Eio.Mutex.use_rw pending_mutex ~protect:true (fun () ->
-      pending_symbols := List.sort_uniq ~cmp:Stdlib.compare (!pending_symbols @ symbols)
-    )
+      let cur = Option.value ~default:[] (Hashtbl.find_opt pending cluster) in
+      Hashtbl.replace pending cluster
+        (List.sort_uniq ~cmp:Stdlib.compare (cur @ symbols)))
 
-  (* Get and clear pending symbols *)
-  let take_pending_symbols () =
+  let take_pending ~cluster =
     Eio.Mutex.use_rw pending_mutex ~protect:true (fun () ->
-      let symbols = !pending_symbols in
-      pending_symbols := [];
-      symbols
-    )
+      let cur = Option.value ~default:[] (Hashtbl.find_opt pending cluster) in
+      Hashtbl.replace pending cluster [];
+      cur)
+
+  (* Clusters whose upstream loop is already running. A cluster's upstream is spawned
+     LAZILY on the first downstream subscription for it, so we only open the Massive
+     connections actually in use (e.g. no futures socket for an equities-only run). *)
+  let started : (Cluster.t, unit) Hashtbl.t = Hashtbl.create 4
+  let started_mutex = Eio.Mutex.create ()
 
   let format_error = function
     | `HandshakeError s -> s
@@ -47,25 +55,29 @@ module Relay = struct
     | `InvalidOpcode i -> "Invalid opcode: " ^ string_of_int i
     | `ConnectionClosed -> "Connection closed"
 
-  (* Main relay loop *)
-  let run ~sw ~env ~massive_key ~local_port =
-    (* Start local server *)
-    Massive_relay.Local_server.start ~sw ~env ~port:local_port
-      ~on_subscribe:(fun symbols -> add_pending_symbols symbols);
-
-    (* Connect to Massive with reconnection loop *)
+  (* The upstream loop for ONE cluster: connect, drain, and fan out to that cluster's
+     downstream clients. Structurally identical to the old single-upstream loop, just
+     scoped to [cluster] (its own pending queue, its own broadcasts). *)
+  let run_cluster ~sw ~env ~massive_key ~cluster =
     let rec connect_loop () =
-      Massive_relay.Log.traceln "Relay: Connecting to Massive...";
-      match Massive_relay.Massive_client.Client.connect ~sw ~env ~massive_key () with
+      Massive_relay.Log.traceln "Relay[%s]: Connecting to Massive..."
+        (Cluster.to_string cluster);
+      match
+        Massive_relay.Massive_client.Client.connect ~sw ~env ~massive_key ~cluster
+          ()
+      with
       | Error e ->
-        Massive_relay.Log.traceln "Relay: Failed to connect to Massive: %s" (format_error e);
-        Massive_relay.Log.traceln "Relay: Retrying in 5 seconds...";
+        Massive_relay.Log.traceln "Relay[%s]: Failed to connect to Massive: %s"
+          (Cluster.to_string cluster) (format_error e);
+        Massive_relay.Log.traceln "Relay[%s]: Retrying in 5 seconds..."
+          (Cluster.to_string cluster);
         Eio.Time.sleep (Eio.Stdenv.clock env) 5.0;
         connect_loop ()
       | Ok client ->
-        Massive_relay.Log.traceln "Relay: Connected to Massive, starting main loop";
+        Massive_relay.Log.traceln
+          "Relay[%s]: Connected to Massive, starting main loop"
+          (Cluster.to_string cluster);
         run_with_client ~sw ~env client
-
     and run_with_client ~sw ~env client =
       let client_ref = ref client in
       let clock = Eio.Stdenv.clock env in
@@ -83,14 +95,16 @@ module Relay = struct
       Eio.Fiber.fork ~sw (fun () ->
         while true do
           Eio.Time.sleep clock 1.0;
-          let new_symbols = take_pending_symbols () in
+          let new_symbols = take_pending ~cluster in
           if List.length new_symbols > 0 then begin
-            Massive_relay.Log.traceln "Relay: Subscribing to %d new symbols" (List.length new_symbols);
+            Massive_relay.Log.traceln "Relay[%s]: Subscribing to %d new symbols"
+              (Cluster.to_string cluster) (List.length new_symbols);
             match Massive_relay.Massive_client.Client.subscribe !client_ref new_symbols with
             | Ok () -> ()
             | Error _ ->
-              Massive_relay.Log.traceln "Relay: Failed to subscribe, will retry";
-              add_pending_symbols new_symbols
+              Massive_relay.Log.traceln "Relay[%s]: Failed to subscribe, will retry"
+                (Cluster.to_string cluster);
+              add_pending ~cluster new_symbols
           end
         done
       );
@@ -134,7 +148,7 @@ module Relay = struct
               Massive_relay.Log.traceln "Relay: Status - %s: %s" status.status status.message
             | Massive_relay.Massive_client.Data { symbol; raw_json } ->
               Hashtbl.replace symbol_last_seen symbol now;
-              Massive_relay.Local_server.broadcast_data ~clock
+              Massive_relay.Local_server.broadcast_data ~clock ~cluster
                 (Yojson.Safe.to_string raw_json)
             | Massive_relay.Massive_client.Unknown _ -> ()
           );
@@ -163,7 +177,7 @@ module Relay = struct
           loop ()
         | Ok `Ping ->
           incr ping_count;
-          Massive_relay.Local_server.broadcast_ping ~clock;
+          Massive_relay.Local_server.broadcast_ping ~clock ~cluster;
           (match !last_data_time with
           | None -> loop ()  (* Never received data — market likely closed *)
           | Some t ->
@@ -203,6 +217,31 @@ module Relay = struct
       loop ()
     in
     connect_loop ()
+
+  (* Ensure a cluster's upstream loop is running; spawn it ONCE, lazily, on the first
+     downstream subscription for that cluster (so we only open the Massive sockets in
+     use). Guarded by [started_mutex] against concurrent first-subscriptions. *)
+  let ensure_cluster ~sw ~env ~massive_key ~cluster =
+    let need_start =
+      Eio.Mutex.use_rw started_mutex ~protect:true (fun () ->
+        if Hashtbl.mem started cluster then false
+        else (
+          Hashtbl.replace started cluster ();
+          true))
+    in
+    if need_start then begin
+      Massive_relay.Log.traceln "Relay[%s]: first subscription — starting upstream"
+        (Cluster.to_string cluster);
+      Eio.Fiber.fork ~sw (fun () -> run_cluster ~sw ~env ~massive_key ~cluster)
+    end
+
+  (* Main relay: start the local server; each cluster's upstream is spawned lazily as
+     downstream clients subscribe on that cluster's path (/stocks, /futures). *)
+  let run ~sw ~env ~massive_key ~local_port =
+    Massive_relay.Local_server.start ~sw ~env ~port:local_port
+      ~on_subscribe:(fun ~cluster symbols ->
+        add_pending ~cluster symbols;
+        ensure_cluster ~sw ~env ~massive_key ~cluster)
 end
 
 module Cmd = struct

@@ -27,4 +27,8 @@
        "ocaml-ca-certs"
        "ocaml-mirage-crypto-rng"
        "ocaml-tls-eio"
-       "ocaml-base64"))
+       "ocaml-base64"
+       "ocaml-containers"
+       "ocaml-digestif"
+       "ocaml-uri"
+       "ocaml-cstruct"))

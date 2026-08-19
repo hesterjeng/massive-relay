@@ -35,6 +35,7 @@ module Client = struct
   type t = {
     conn : Websocket.Connection.t;
     massive_key : string;
+    cluster : Cluster.t;
     mutable subscribed_symbols : string list;
     mutable reconnect_attempts : int;
   }
@@ -48,22 +49,24 @@ module Client = struct
     let delay = base_delay *. (2.0 ** Float.of_int (min attempt 6)) in
     Float.min delay max_delay
 
-  (* Connect to Massive WebSocket with retry logic *)
-  let rec connect_with_retry ~sw ~env ~massive_key ~attempt () =
-    let url = Uri.of_string "wss://socket.polygon.io/stocks" in
+  (* Connect to Massive WebSocket with retry logic. [cluster] selects the upstream
+     endpoint path (/stocks, /futures). *)
+  let rec connect_with_retry ~sw ~env ~massive_key ~cluster ~attempt () =
+    let url = Uri.of_string (Cluster.upstream_url cluster) in
     let authenticator = Https.authenticator () in
 
     if attempt > 0 then
-      Log.traceln "Massive: Connection attempt %d/%d" attempt max_reconnect_attempts;
+      Log.traceln "Massive[%s]: Connection attempt %d/%d" (Cluster.to_string cluster) attempt max_reconnect_attempts;
 
-    Log.traceln "Massive: Connecting to %s..." (Uri.to_string url);
+    Log.traceln "Massive[%s]: Connecting to %s..." (Cluster.to_string cluster) (Uri.to_string url);
 
     match Websocket.Connection.handshake ~sw ~env ~authenticator url with
     | Ok conn ->
-      Log.traceln "Massive: Connected successfully";
+      Log.traceln "Massive[%s]: Connected successfully" (Cluster.to_string cluster);
       Ok {
         conn;
         massive_key;
+        cluster;
         subscribed_symbols = [];
         reconnect_attempts = attempt;
       }
@@ -78,15 +81,17 @@ module Client = struct
          | `HandshakeError s -> "Handshake error: " ^ s);
       Log.traceln "Massive: Retrying in %.1f seconds" delay;
       Eio.Time.sleep (Eio.Stdenv.clock env) delay;
-      connect_with_retry ~sw ~env ~massive_key ~attempt:(attempt + 1) ()
+      connect_with_retry ~sw ~env ~massive_key ~cluster ~attempt:(attempt + 1) ()
     | Error e ->
       Log.traceln "Massive: Max reconnection attempts reached";
       Error e
 
-  (* Initial connection with authentication *)
-  let connect ~sw ~env ~massive_key () =
+  (* Initial connection with authentication, to a specific [cluster]. *)
+  let connect ~sw ~env ~massive_key ~cluster () =
     let ( let* ) = Result.( let* ) in
-    let* client = connect_with_retry ~sw ~env ~massive_key ~attempt:0 () in
+    let* client =
+      connect_with_retry ~sw ~env ~massive_key ~cluster ~attempt:0 ()
+    in
 
     (* Send authentication message *)
     let auth_msg : auth_message = {
@@ -229,8 +234,10 @@ module Client = struct
     (* Close old connection first to release file descriptor *)
     close client;
 
-    Log.traceln "Massive: Attempting to reconnect...";
-    let* new_client = connect ~sw ~env ~massive_key:client.massive_key () in
+    Log.traceln "Massive[%s]: Attempting to reconnect..." (Cluster.to_string client.cluster);
+    let* new_client =
+      connect ~sw ~env ~massive_key:client.massive_key ~cluster:client.cluster ()
+    in
 
     (* Update reconnect count *)
     new_client.reconnect_attempts <- client.reconnect_attempts + 1;

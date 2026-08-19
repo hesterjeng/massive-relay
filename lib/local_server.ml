@@ -24,10 +24,13 @@ let status_message status message =
   ] in
   Yojson.Safe.to_string (`List [msg])
 
-(* Client connection *)
+(* Client connection. [cluster] is fixed at connect time by the request PATH
+   (/stocks | /futures) and scopes both this client's subscriptions (to the matching
+   upstream) and the broadcasts it receives (only that cluster's data). *)
 type client = {
   id : int;
   flow : Eio.Flow.two_way_ty Eio.Resource.t;
+  cluster : Cluster.t;
   mutable subscribed_symbols : string list;
 }
 
@@ -36,14 +39,15 @@ let clients : client list ref = ref []
 let next_client_id = ref 0
 let clients_mutex = Eio.Mutex.create ()
 
-(* Add a client *)
-let add_client flow =
+(* Add a client on a given cluster *)
+let add_client ~cluster flow =
   Eio.Mutex.use_rw clients_mutex ~protect:true (fun () ->
     let id = !next_client_id in
     incr next_client_id;
-    let client = { id; flow; subscribed_symbols = [] } in
+    let client = { id; flow; cluster; subscribed_symbols = [] } in
     clients := client :: !clients;
-    Log.traceln "Local: Client %d connected (total: %d)" id (List.length !clients);
+    Log.traceln "Local: Client %d connected on %s (total: %d)" id
+      (Cluster.to_string cluster) (List.length !clients);
     client
   )
 
@@ -103,16 +107,18 @@ let maybe_log_stats () =
     last_stats_time := now
   end
 
-(* Broadcast to all connected clients.
-   Every upstream message is for a symbol some client requested, so no
-   per-symbol filtering needed — clients ignore irrelevant symbols.
-   Collects failed clients under read lock, removes them after. *)
-let broadcast ~clock msg =
+(* Broadcast to the clients of ONE cluster (a cluster's upstream data must not leak
+   to another cluster's clients). Every message is for a symbol some client of that
+   cluster requested, so no per-symbol filtering is needed — clients ignore
+   irrelevant symbols. Collects failed clients under read lock, removes them after. *)
+let broadcast ~clock ~cluster msg =
   let failed =
     Eio.Mutex.use_ro clients_mutex (fun () ->
       incr broadcast_count;
       let failed =
-        !clients |> List.filter_map (fun client ->
+        !clients
+        |> List.filter (fun c -> Cluster.equal c.cluster cluster)
+        |> List.filter_map (fun client ->
           if send_to_client ~clock client msg then
             (incr send_success_count; None)
           else
@@ -124,18 +130,20 @@ let broadcast ~clock msg =
   List.iter remove_client failed
 
 (* Broadcast data message wrapped in array (Massive protocol) *)
-let broadcast_data ~clock json_str =
-  broadcast ~clock ("[" ^ json_str ^ "]")
+let broadcast_data ~clock ~cluster json_str =
+  broadcast ~clock ~cluster ("[" ^ json_str ^ "]")
 
-(* Send a Ping frame to all connected clients, keeping connections alive. *)
-let broadcast_ping ~clock =
+(* Send a Ping frame to a cluster's clients, keeping connections alive. *)
+let broadcast_ping ~clock ~cluster =
   let ping_frame = Websocket.Frame.{
     fin = true; opcode = Ping; mask = false; payload = "";
   } in
   let encoded = Websocket.Frame.encode ping_frame in
   let failed =
     Eio.Mutex.use_ro clients_mutex (fun () ->
-      !clients |> List.filter_map (fun client ->
+      !clients
+      |> List.filter (fun c -> Cluster.equal c.cluster cluster)
+      |> List.filter_map (fun client ->
         try
           Eio.Time.with_timeout_exn clock 5.0 (fun () ->
             Eio.Flow.copy_string encoded client.flow);
@@ -179,6 +187,17 @@ let websocket_handshake flow =
     else ""
   in
 
+  (* The request line ("GET /futures HTTP/1.1") carries the PATH that selects the
+     cluster. Second whitespace-separated token; default "/" if malformed. *)
+  let path =
+    match String.split_on_char '\n' request with
+    | line :: _ -> (
+      match String.split_on_char ' ' (String.trim line) with
+      | _method :: p :: _ -> p
+      | _ -> "/")
+    | [] -> "/"
+  in
+
   (* Extract Sec-WebSocket-Key header *)
   let lines = String.split_on_char '\n' request in
   let ws_key = List.find_map (fun line ->
@@ -210,10 +229,10 @@ let websocket_handshake flow =
       accept_key
     in
     Eio.Flow.copy_string response flow;
-    Log.traceln "Local: WebSocket handshake completed";
+    Log.traceln "Local: WebSocket handshake completed (path %s)" path;
     if String.length leftover > 0 then
       Log.traceln "Local: %d leftover bytes after handshake headers" (String.length leftover);
-    Ok leftover
+    Ok (path, leftover)
 
 (* Handle a client connection *)
 let handle_client ~clock ~on_subscribe flow _addr =
@@ -224,8 +243,11 @@ let handle_client ~clock ~on_subscribe flow _addr =
   (* Perform WebSocket handshake *)
   match websocket_handshake flow with
   | Error _ -> ()
-  | Ok leftover ->
-    let client = add_client (flow :> Eio.Flow.two_way_ty Eio.Resource.t) in
+  | Ok (path, leftover) ->
+    let cluster = Cluster.of_path path in
+    let client =
+      add_client ~cluster (flow :> Eio.Flow.two_way_ty Eio.Resource.t)
+    in
     let leftover_ref = ref leftover in
 
     (* Send Massive-style connected status *)
@@ -252,9 +274,10 @@ let handle_client ~clock ~on_subscribe flow _addr =
             | "subscribe" ->
               let symbols = parse_params req.params in
               update_subscriptions client symbols;
-              on_subscribe symbols;
-              Log.traceln "Local: Client %d subscribed to: %s"
-                client.id (String.concat ", " symbols);
+              on_subscribe ~cluster symbols;
+              Log.traceln "Local: Client %d [%s] subscribed to: %s"
+                client.id (Cluster.to_string cluster)
+                (String.concat ", " symbols);
               ignore (send_to_client ~clock client (status_message "success" "Subscribed"))
             | "unsubscribe" ->
               let symbols = parse_params req.params in
