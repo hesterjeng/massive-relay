@@ -8,7 +8,7 @@ env:
 	guix shell -m manifest.scm
 
 run:
-	. $(CURDIR)/.envrc && dune exec bin/massive_relay.exe
+	dune exec bin/massive_relay.exe
 
 # Run with output to log file (can safely delete/truncate relay.log while running)
 run-log:
