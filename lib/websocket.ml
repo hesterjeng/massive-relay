@@ -268,7 +268,16 @@ module Connection = struct
     in
 
     Log.traceln "WebSocket: Connecting to %a:%d" Eio.Net.Sockaddr.pp sock_addr port;
-    let tcp_flow = Eio.Net.connect ~sw net sock_addr in
+    (* Eio.Net.connect raises (e.g. Eio.Io Net Connection_failure Refused on a
+       refused/reset TCP connection) rather than returning a result. Convert it
+       to an Error so it feeds the caller's backoff-retry loop instead of
+       crashing the process. *)
+    let* tcp_flow =
+      try Ok (Eio.Net.connect ~sw net sock_addr)
+      with
+      | Eio.Cancel.Cancelled _ as e -> raise e
+      | e -> Error (`HandshakeError ("TCP connect failed: " ^ Printexc.to_string e))
+    in
 
     (* Wrap with TLS if wss:// *)
     (* Returns (flow, close_fn) - close_fn releases the underlying socket *)
@@ -287,7 +296,13 @@ module Connection = struct
             (try Eio.Flow.close tcp_flow with _ -> ())
           in
           Ok ((tls_flow :> Eio.Flow.two_way_ty Eio.Resource.t), close_fn)
-        with e -> Error (`TlsError (Printexc.to_string e))
+        with
+        | Eio.Cancel.Cancelled _ as e -> raise e
+        | e ->
+          (* TLS handshake failed (e.g. End_of_file) after the TCP socket was
+             opened — release it so failed retries don't leak file descriptors. *)
+          (try Eio.Flow.close tcp_flow with _ -> ());
+          Error (`TlsError (Printexc.to_string e))
       end else
         let close_fn () = (try Eio.Flow.close tcp_flow with _ -> ()) in
         Ok ((tcp_flow :> Eio.Flow.two_way_ty Eio.Resource.t), close_fn)
@@ -316,7 +331,16 @@ module Connection = struct
     in
 
     Log.traceln "WebSocket: Sending handshake";
-    Eio.Flow.copy_string handshake_request flow;
+    (* Guard the handshake write: the peer may reset the connection here. On
+       failure release the socket we just opened before erroring out. *)
+    let* () =
+      try Ok (Eio.Flow.copy_string handshake_request flow)
+      with
+      | Eio.Cancel.Cancelled _ as e -> raise e
+      | e ->
+        close_fn ();
+        Error (`HandshakeError ("handshake write failed: " ^ Printexc.to_string e))
+    in
 
     (* Read handshake response - buffered approach for performance *)
     (* Returns ALL data read, including any bytes after \r\n\r\n *)
@@ -343,7 +367,17 @@ module Connection = struct
         find_end 0
     in
 
-    let full_data = read_until_double_crlf "" in
+    let* full_data =
+      try Ok (read_until_double_crlf "")
+      with
+      | Eio.Cancel.Cancelled _ as e -> raise e
+      | End_of_file ->
+        close_fn ();
+        Error (`HandshakeError "connection closed during handshake response")
+      | e ->
+        close_fn ();
+        Error (`HandshakeError ("handshake read failed: " ^ Printexc.to_string e))
+    in
 
     (* Find the end of HTTP headers *)
     let header_end =
@@ -379,8 +413,10 @@ module Connection = struct
       if String.length response >= 12 &&
          String.equal (String.sub response 0 12) "HTTP/1.1 101" then
         Ok ()
-      else
+      else begin
+        close_fn ();
         Error (`HandshakeError ("Server did not return 101: " ^ String.sub response 0 (min 50 (String.length response))))
+      end
     in
 
     Ok { flow; close_fn; url; closed = false; leftover;

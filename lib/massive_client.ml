@@ -40,13 +40,19 @@ module Client = struct
     mutable reconnect_attempts : int;
   }
 
-  (* Exponential backoff configuration *)
+  (* Exponential backoff configuration. Delays double each attempt up to
+     [max_delay] (1 hour), for [max_reconnect_attempts] attempts per burst.
+     When a burst is exhausted the caller's outer loop restarts it from
+     attempt 0, so the relay keeps trying indefinitely but at steady state
+     hits the upstream at most once per hour. *)
   let base_delay = 1.0
-  let max_delay = 60.0
-  let max_reconnect_attempts = 10
+  let max_delay = 3600.0
+  let max_reconnect_attempts = 15
 
   let calculate_backoff_delay attempt =
-    let delay = base_delay *. (2.0 ** Float.of_int (min attempt 6)) in
+    (* 2^12 = 4096 > max_delay, so the exponent is capped at 12 to reach the
+       1-hour ceiling without overflowing the float shift. *)
+    let delay = base_delay *. (2.0 ** Float.of_int (min attempt 12)) in
     Float.min delay max_delay
 
   (* Connect to Massive WebSocket with retry logic. [cluster] selects the upstream
@@ -145,8 +151,14 @@ module Client = struct
             payload = frame.payload;
           } in
           let encoded = Websocket.Frame.encode pong_frame in
-          Eio.Flow.copy_string encoded client.conn.flow;
-          wait_for_auth retry_count
+          (* A failed pong write here means the connection died mid-auth —
+             report it so connect() retries rather than crashing. *)
+          (try
+            Eio.Flow.copy_string encoded client.conn.flow;
+            wait_for_auth retry_count
+          with
+          | Eio.Cancel.Cancelled _ as e -> raise e
+          | _ -> Error `ConnectionClosed)
         | _ -> wait_for_auth (retry_count + 1)
     in
 
@@ -215,8 +227,14 @@ module Client = struct
         payload = frame.payload;
       } in
       let encoded = Websocket.Frame.encode pong_frame in
-      Eio.Flow.copy_string encoded client.conn.flow;
-      Ok `Ping
+      (* A failed pong write means the socket is dead — surface it as a closed
+         connection so the caller reconnects, rather than throwing. *)
+      (try
+        Eio.Flow.copy_string encoded client.conn.flow;
+        Ok `Ping
+      with
+      | Eio.Cancel.Cancelled _ as e -> raise e
+      | _ -> Error `ConnectionClosed)
     | Close ->
       Log.traceln "Massive: Received CLOSE frame";
       Error `ConnectionClosed
